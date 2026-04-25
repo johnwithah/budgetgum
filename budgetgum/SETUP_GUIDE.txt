@@ -1,0 +1,75 @@
+═══════════════════════════════════════════════════════
+  BUDGETGUM — SETUP GUIDE
+═══════════════════════════════════════════════════════
+
+ACCOUNTS NEEDED (all free)
+  ✅ GitHub    — github.com
+  ✅ Vercel    — vercel.com
+  ✅ Plaid     — dashboard.plaid.com
+
+
+STEP 1 — Upload to GitHub
+─────────────────────────
+1. Go to github.com → click "+" → New repository
+2. Name: budgetgum  |  Private  |  Check "Add README"
+3. Click Create repository
+4. Click Add file → Upload files
+5. Drag the entire unzipped "budgetgum" folder in
+6. Commit message: "Initial upload"
+7. Click Commit changes
+
+
+STEP 2 — Deploy on Vercel
+──────────────────────────
+1. Go to vercel.com → Add New Project
+2. Import your "budgetgum" repo from GitHub
+3. Framework Preset: Create React App
+4. Expand Environment Variables — add these 3:
+
+     PLAID_CLIENT_ID   →  your client_id from Plaid dashboard
+     PLAID_SECRET      →  your secret key from Plaid dashboard
+     PLAID_ENV         →  sandbox
+
+   (Find keys at: dashboard.plaid.com → Team Settings → Keys)
+
+5. Click Deploy (~2 min)
+6. Click Visit → your app is live!
+
+
+STEP 3 — Install on iPhone
+────────────────────────────
+1. Open your Vercel URL in SAFARI (must be Safari)
+2. Tap the Share button (box with arrow)
+3. Tap "Add to Home Screen"
+4. Name it Budgetgum → tap Add
+→ App icon appears on your home screen!
+
+
+STEP 4 — Connect Ally Bank (inside the app)
+─────────────────────────────────────────────
+1. Open Budgetgum from your home screen
+2. Tap "Connect Your Bank"
+3. Plaid's secure screen opens → search Ally → log in
+4. Select your accounts → Continue
+→ Real balance and last 30 days of transactions appear!
+
+
+SWITCHING TO LIVE DATA (after Plaid approves)
+───────────────────────────────────────────────
+1. Get your Development secret from Plaid dashboard
+2. Vercel → budgetgum project → Settings → Env Variables
+3. Update PLAID_SECRET → development secret
+4. Update PLAID_ENV   → development
+5. Save → Vercel redeploys automatically
+
+
+TIPS
+────
+Sync transactions:  Activity tab → "↻ Sync Bank"
+Add envelope:       Envelopes tab → "+ New"
+Log expense:        Any envelope → "Add Expense"
+Pay a bill:         Bills tab → tap bill → Confirm Payment
+Reset data:         iPhone Settings → Safari → Advanced
+                    → Website Data → find your URL → delete
+
+═══════════════════════════════════════════════════════
