@@ -32,7 +32,7 @@ function guessEnvelope(tx) {
 }
 
 const fmt     = n => new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(n);
-const ordinal = n => `${n}${[,"st","nd","rd"][n]||"th"}`;
+const ordinal = n => `${n}${["","st","nd","rd"][n]||"th"}`;
 function getDays(dueDay) {
   const today=new Date(), d=new Date(today.getFullYear(),today.getMonth(),dueDay);
   if (d<today) d.setMonth(d.getMonth()+1);
