@@ -873,29 +873,114 @@ function CalendarTab({ envelopes }) {
   );
 }
 
+
+
 // ─── Transactions Tab ─────────────────────────────────────────────────────────
 function TransactionsTab({ transactions, setTransactions, envelopes }) {
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("all"); // all | unassigned | credits
+  const [filter, setFilter] = useState("all");
   const [expandedId, setExpandedId] = useState(null);
   const [assignSelections, setAssignSelections] = useState({});
-  const [importing, setImporting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [syncError, setSyncError] = useState(null);
 
-  const filtered = useMemo(() => {
-    return transactions.filter(t => {
-      const matchSearch = t.name.toLowerCase().includes(search.toLowerCase());
-      const matchFilter = filter === "all" ? true : filter === "unassigned" ? !t.assignedEnv : filter === "credits" ? t.amount > 0 : true;
-      return matchSearch && matchFilter;
-    });
-  }, [transactions, search, filter]);
+  // Whether a real access token is stored (set after successful Plaid Link)
+  const [linked, setLinked] = useState(() => !!localStorage.getItem("bg_plaid_linked"));
 
-  // Group by date
+  // ── Plaid Link launcher ──────────────────────────────────────────────────────
+  const openPlaidLink = async () => {
+    setConnecting(true);
+    setSyncError(null);
+    try {
+      // 1. Get a link token from your Vercel function
+      const ltRes = await fetch("/api/create_link_token", { method: "POST" });
+      if (!ltRes.ok) throw new Error("Could not create link token");
+      const { link_token } = await ltRes.json();
+
+      // 2. Load Plaid Link script if not already present
+      if (!window.Plaid) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
+          s.onload = resolve;
+          s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+
+      // 3. Open Plaid Link
+      const handler = window.Plaid.create({
+        token: link_token,
+        onSuccess: async (public_token, metadata) => {
+          // 4. Exchange public token for access token (stored server-side in your Vercel fn)
+          const exRes = await fetch("/api/exchange_public_token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ public_token }),
+          });
+          if (!exRes.ok) throw new Error("Token exchange failed");
+          localStorage.setItem("bg_plaid_linked", "true");
+          setLinked(true);
+          setConnecting(false);
+          // 5. Immediately fetch transactions
+          fetchTransactions();
+        },
+        onExit: (err) => {
+          setConnecting(false);
+          if (err) setSyncError("Connection cancelled or failed. Try again.");
+        },
+      });
+      handler.open();
+    } catch (e) {
+      setConnecting(false);
+      setSyncError(e.message || "Something went wrong. Check your Vercel env vars.");
+    }
+  };
+
+  // ── Fetch real transactions from Vercel → Plaid ──────────────────────────────
+  const fetchTransactions = async () => {
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      const res = await fetch("/api/get_transactions", { method: "POST" });
+      if (!res.ok) throw new Error("Sync failed — check Vercel logs");
+      const data = await res.json();
+      // Normalize Plaid transaction shape to Budgetgum shape
+      const normalized = (data.transactions || []).map(t => ({
+        id: t.transaction_id,
+        name: t.name || t.merchant_name || "Unknown",
+        amount: -(t.amount), // Plaid debits are positive; flip sign
+        date: t.date,
+        source: "plaid",
+        assignedEnv: null,
+        matchedBill: null,
+      }));
+      // Merge: keep existing assignments, add new transactions
+      setTransactions(prev => {
+        const existingIds = new Set(prev.map(t => t.id));
+        const merged = [...prev];
+        normalized.forEach(t => {
+          if (!existingIds.has(t.id)) merged.push(t);
+        });
+        return merged.sort((a, b) => b.date.localeCompare(a.date));
+      });
+    } catch (e) {
+      setSyncError(e.message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const filtered = useMemo(() => transactions.filter(t => {
+    const matchSearch = t.name.toLowerCase().includes(search.toLowerCase());
+    const matchFilter = filter === "all" ? true : filter === "unassigned" ? !t.assignedEnv : t.amount > 0;
+    return matchSearch && matchFilter;
+  }), [transactions, search, filter]);
+
   const grouped = useMemo(() => {
     const groups = {};
-    filtered.forEach(t => {
-      if (!groups[t.date]) groups[t.date] = [];
-      groups[t.date].push(t);
-    });
+    filtered.forEach(t => { if (!groups[t.date]) groups[t.date] = []; groups[t.date].push(t); });
     return Object.entries(groups).sort(([a], [b]) => b.localeCompare(a));
   }, [filtered]);
 
@@ -910,57 +995,68 @@ function TransactionsTab({ transactions, setTransactions, envelopes }) {
     setTransactions(prev => prev.map(t => t.id === txnId ? { ...t, matchedBill: billId } : t));
   };
 
-  const handleManualImport = () => {
-    setImporting(true);
-    // Simulate a Plaid sync re-fetch with slight delay
-    setTimeout(() => {
-      setTransactions(DEMO_TRANSACTIONS);
-      setImporting(false);
-    }, 1200);
-  };
-
   const unassignedCount = transactions.filter(t => !t.assignedEnv && t.amount < 0).length;
-
-  const formatDate = (dateStr) => {
-    const d = new Date(dateStr + "T12:00:00");
-    return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-  };
-
-  // Get all bills for matching
-  const allBills = envelopes.flatMap(env => env.bills.map(b => ({ ...b, envName: env.name })));
+  const formatDate = (dateStr) => new Date(dateStr + "T12:00:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
 
   return (
     <div className="txn-wrap">
-      <div className="txn-toolbar">
-        <input className="txn-search" placeholder="Search transactions..." value={search} onChange={e => setSearch(e.target.value)} />
-        <button className={`txn-import-btn`} onClick={handleManualImport} disabled={importing}>
-          {importing ? "Syncing…" : "⟳ Sync"}
-        </button>
-      </div>
 
-      <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
-        {["all","unassigned","credits"].map(f => (
-          <button key={f} className={`txn-filter-btn${filter === f ? " active" : ""}`} onClick={() => setFilter(f)}>
-            {f === "all" ? "All" : f === "unassigned" ? `Unassigned${unassignedCount > 0 ? ` (${unassignedCount})` : ""}` : "Credits"}
+      {/* ── Connect / sync banner ── */}
+      {!linked ? (
+        <div className="txn-plaid-banner" style={{ marginTop: 16 }}>
+          <div className="txn-plaid-title" style={{ marginBottom: 10 }}>🏦 Connect Your Bank</div>
+          <div className="txn-plaid-sub" style={{ marginBottom: 16 }}>
+            Link your Ally account (or any bank) via Plaid to pull in real transactions and match them to your envelopes.
+          </div>
+          <button
+            className="btn-full"
+            onClick={openPlaidLink}
+            disabled={connecting}
+            style={{ marginTop: 0 }}
+          >
+            {connecting ? "Opening Plaid…" : "🔗 Connect Bank Account"}
           </button>
-        ))}
-      </div>
+          {syncError && <div style={{ fontSize: 12, color: T.red, marginTop: 10 }}>{syncError}</div>}
+        </div>
+      ) : (
+        <>
+          <div className="txn-toolbar">
+            <input className="txn-search" placeholder="Search transactions..." value={search} onChange={e => setSearch(e.target.value)} />
+            <button className="txn-import-btn" onClick={fetchTransactions} disabled={syncing}>
+              {syncing ? "Syncing…" : "⟳ Sync"}
+            </button>
+          </div>
 
-      <div className="txn-plaid-banner">
-        <div className="txn-plaid-title">🏦 Plaid · Sandbox Mode</div>
-        <div className="txn-plaid-sub">Showing demo transactions. Once your Plaid Development access is approved, swap in your live secret key in Vercel env vars and real Ally transactions will appear here automatically.</div>
-      </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+            {["all","unassigned","credits"].map(f => (
+              <button key={f} className={`txn-filter-btn${filter === f ? " active" : ""}`} onClick={() => setFilter(f)}>
+                {f === "all" ? "All" : f === "unassigned" ? `Unassigned${unassignedCount > 0 ? ` (${unassignedCount})` : ""}` : "Credits"}
+              </button>
+            ))}
+            <button className="txn-filter-btn" onClick={() => { localStorage.removeItem("bg_plaid_linked"); setLinked(false); setTransactions([]); }} style={{ marginLeft: "auto", color: T.textDim }}>
+              Disconnect
+            </button>
+          </div>
 
-      {grouped.length === 0 && (
-        <div className="empty"><div className="empty-icon">🔍</div><div className="empty-title">No transactions found</div></div>
+          {syncError && (
+            <div style={{ background: T.red + "22", border: `1px solid ${T.red}44`, borderRadius: 10, padding: "10px 14px", fontSize: 12, color: T.red, marginBottom: 12 }}>
+              {syncError}
+            </div>
+          )}
+        </>
       )}
 
-      {grouped.map(([date, txns]) => (
+      {grouped.length === 0 && linked && (
+        <div className="empty"><div className="empty-icon">🔍</div><div className="empty-title">{transactions.length === 0 ? "No transactions yet" : "No matches"}</div><div className="empty-sub">{transactions.length === 0 ? "Tap ⟳ Sync to pull in your latest transactions." : "Try a different search or filter."}</div></div>
+      )}
+
+      {linked && grouped.map(([date, txns]) => (
         <div key={date}>
           <div className="txn-group-label">{formatDate(date)}</div>
           {txns.map(t => {
             const isExpanded = expandedId === t.id;
             const assignedEnv = envelopes.find(e => e.id === t.assignedEnv);
+            const envBills = envelopes.find(e => e.id === t.assignedEnv)?.bills || [];
             return (
               <div key={t.id} className={`txn-item${t.assignedEnv ? " assigned" : ""}${t.matchedBill ? " matched" : ""}`}>
                 <div className="txn-row" onClick={() => setExpandedId(isExpanded ? null : t.id)} style={{ cursor: "pointer" }}>
@@ -968,7 +1064,7 @@ function TransactionsTab({ transactions, setTransactions, envelopes }) {
                   <div className="txn-info">
                     <div className="txn-name">{t.name}</div>
                     <div className="txn-meta">
-                      {t.source === "plaid" ? "Plaid · Ally" : "Manual"}
+                      Plaid · Ally
                       {assignedEnv && <span className="txn-assigned-tag"> → {assignedEnv.icon} {assignedEnv.name}</span>}
                     </div>
                   </div>
@@ -993,10 +1089,10 @@ function TransactionsTab({ transactions, setTransactions, envelopes }) {
                   </div>
                 )}
 
-                {isExpanded && t.assignedEnv && allBills.filter(b => b.envId === t.assignedEnv || envelopes.find(e => e.id === t.assignedEnv)?.bills.find(b2 => b2.id === b.id)).length > 0 && !t.matchedBill && (
+                {isExpanded && t.assignedEnv && envBills.length > 0 && !t.matchedBill && (
                   <div style={{ marginTop: 8, padding: "8px 0 0", borderTop: `1px solid ${T.border}` }}>
                     <div style={{ fontSize: 11, color: T.textDim, marginBottom: 8 }}>Match to a bill to confirm payment processed:</div>
-                    {envelopes.find(e => e.id === t.assignedEnv)?.bills.map(bill => (
+                    {envBills.map(bill => (
                       <button key={bill.id} className="txn-match-btn" style={{ marginRight: 6, marginBottom: 6 }}
                         onClick={() => handleMatchBill(t.id, bill.id)}>
                         ✓ Match: {bill.name}
