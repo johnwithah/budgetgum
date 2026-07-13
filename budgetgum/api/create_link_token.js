@@ -21,7 +21,8 @@ module.exports = async (req, res) => {
     });
     res.json({ link_token: response.data.link_token });
   } catch (err) {
-    console.error('create_link_token error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to create link token' });
-  }
+  const detail = err.response?.data || { message: err.message };
+  console.error('create_link_token error:', JSON.stringify(detail));
+  res.status(500).json({ error: 'Failed to create link token', plaid: detail });
+}
 };
