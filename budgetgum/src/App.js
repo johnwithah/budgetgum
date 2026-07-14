@@ -1,48 +1,15 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { usePlaidLink } from "react-plaid-link";
+import {
+  TYPES, TYPE_META, isBill, hasTarget,
+  nextDueDate, lockDate, isLocked, daysUntilLock, isPaid, paidThisPeriod, periodKey,
+  spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
+  safeToSpend, shortfall, upcomingLocks, buildAlerts,
+  matchEnvelope, normalizeMerchant,
+  money, daysBetween, DOW,
+} from "./engine";
 
-// ─── Defaults ─────────────────────────────────────────────────────────────────
-const DEFAULT_ENVELOPES = [
-  { id: 1, name: "Groceries",     budget: 600,  spent: 0, color: "#30d158", icon: "🛒" },
-  { id: 2, name: "Rent",          budget: 1800, spent: 0, color: "#0a84ff", icon: "🏠" },
-  { id: 3, name: "Utilities",     budget: 200,  spent: 0, color: "#ffd60a", icon: "⚡" },
-  { id: 4, name: "Transport",     budget: 150,  spent: 0, color: "#bf5af2", icon: "🚗" },
-  { id: 5, name: "Dining Out",    budget: 300,  spent: 0, color: "#ff375f", icon: "🍕" },
-  { id: 6, name: "Entertainment", budget: 100,  spent: 0, color: "#ff9f0a", icon: "🎬" },
-];
-
-const DEFAULT_BILLS = [
-  { id: 1, name: "Rent",          amount: 1800,  dueDay: 1,  envelopeId: 2, paid: false, category: "Housing" },
-  { id: 2, name: "Electric Bill", amount: 85,    dueDay: 15, envelopeId: 3, paid: false, category: "Utilities" },
-  { id: 3, name: "Internet",      amount: 60,    dueDay: 20, envelopeId: 3, paid: false, category: "Utilities" },
-  { id: 4, name: "Spotify",       amount: 10.99, dueDay: 8,  envelopeId: 6, paid: false, category: "Subscriptions" },
-  { id: 5, name: "Car Insurance", amount: 120,   dueDay: 22, envelopeId: 4, paid: false, category: "Transport" },
-  { id: 6, name: "Netflix",       amount: 15.99, dueDay: 12, envelopeId: 6, paid: false, category: "Subscriptions" },
-];
-
-function guessEnvelope(tx) {
-  const n = (tx.desc || "").toLowerCase();
-  if (/rent|apartment|lease/.test(n)) return 2;
-  if (/electric|utility|water|gas bill|internet|wifi|at&t|verizon|comcast/.test(n)) return 3;
-  if (/uber|lyft|gas station|parking|transit|metro/.test(n)) return 4;
-  if (/restaurant|cafe|coffee|mcdonald|chipotle|doordash|grubhub|ubereats/.test(n)) return 5;
-  if (/netflix|spotify|hulu|disney|amazon prime|apple/.test(n)) return 6;
-  if (/whole foods|trader joe|kroger|safeway|walmart|target|costco|aldi|publix|harris teeter/.test(n)) return 1;
-  const m = { FOOD_AND_DRINK:1, GROCERIES:1, TRANSPORTATION:4, TRAVEL:4, ENTERTAINMENT:6, RESTAURANTS:5, RENT_AND_UTILITIES:3 };
-  return m[tx.category] || null;
-}
-
-const fmt = n => new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(n);
-const ordinal = n => { const s=["th","st","nd","rd"]; const v=n%100; return `${n}${s[(v-20)%10]||s[v]||s[0]}`; };
-function getDays(dueDay) {
-  const t = new Date(), d = new Date(t.getFullYear(), t.getMonth(), dueDay);
-  if (d < t) d.setMonth(d.getMonth()+1);
-  return Math.ceil((d-t)/86400000);
-}
-const urgency = d => d<=3 ? "#ff375f" : d<=7 ? "#ffd60a" : "#30d158";
-
-// Budget config still lives in localStorage — envelopes and bills are just your
-// own categories, not secrets. The access token is what moved server-side.
+// ─── persistence ──────────────────────────────────────────────────────────────
 function usePersisted(key, def) {
   const [val, set] = useState(() => {
     try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : def; }
@@ -52,11 +19,6 @@ function usePersisted(key, def) {
   return [val, set];
 }
 
-const ICONS  = ["💰","🛒","🏠","⚡","🚗","🍕","🎬","💊","✈️","🎓","👗","🐾","🏋️","📱","🎮"];
-const COLORS = ["#30d158","#0a84ff","#ffd60a","#bf5af2","#ff375f","#ff9f0a","#64d2ff","#5e5ce6","#ff6961","#34c759"];
-
-// Every fetch sends the session cookie. `credentials: "same-origin"` is what
-// makes the browser attach it.
 const api = (path, body) =>
   fetch(path, {
     method: "POST",
@@ -65,738 +27,1311 @@ const api = (path, body) =>
     body: body ? JSON.stringify(body) : undefined,
   });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LOCK SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function LockScreen({ onUnlock }) {
-  const [pw, setPw] = useState("");
-  const [err, setErr] = useState(null);
-  const [busy, setBusy] = useState(false);
+const ICONS  = ["💳","🏦","🏠","⚡","🚗","🛒","🍕","🎬","💊","✈️","🎓","📱","🐾","🏋️","🎮","💰","🎯","📚"];
+const COLORS = ["#30d158","#0a84ff","#ffd60a","#bf5af2","#ff375f","#ff9f0a","#64d2ff","#5e5ce6","#ff6961","#34c759"];
 
+// ═════════════════════════════════════════════════════════════════════════════
+// LOCK SCREEN
+// ═════════════════════════════════════════════════════════════════════════════
+function LockScreen({ onUnlock }) {
+  const [pw, setPw] = useState(""); const [err, setErr] = useState(null); const [busy, setBusy] = useState(false);
   async function submit() {
     if (!pw || busy) return;
     setBusy(true); setErr(null);
     try {
       const r = await api("/api/login", { password: pw });
       if (r.ok) { setPw(""); onUnlock(); }
-      else {
-        const d = await r.json().catch(() => ({}));
-        setErr(d.error || "Incorrect password");
-      }
-    } catch {
-      setErr("Connection failed");
-    }
+      else { const d = await r.json().catch(()=>({})); setErr(d.error || "Incorrect password"); }
+    } catch { setErr("Connection failed"); }
     setBusy(false);
   }
-
   return (
-    <div style={{fontFamily:"-apple-system,'SF Pro Display','Helvetica Neue',sans-serif",background:"#000",minHeight:"100vh",color:"#fff",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"0 32px",maxWidth:430,margin:"0 auto"}}>
-      <style>{`
-        *{box-sizing:border-box;margin:0;padding:0}
-        input::placeholder{color:#48484a}
-        @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
-        .shake{animation:shake .3s}
-      `}</style>
-
+    <div style={{fontFamily:"-apple-system,'SF Pro Display',sans-serif",background:"#000",minHeight:"100vh",color:"#fff",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"0 32px",maxWidth:430,margin:"0 auto"}}>
+      <style>{`*{box-sizing:border-box;margin:0;padding:0}input::placeholder{color:#48484a}
+        @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}.shake{animation:shake .3s}`}</style>
       <div style={{fontSize:64,marginBottom:20}}>🍬</div>
       <div style={{fontSize:32,fontWeight:700,letterSpacing:"-1.2px",marginBottom:6}}>Budgetgum</div>
-      <div style={{fontSize:15,color:"#636366",marginBottom:36,letterSpacing:"-.2px"}}>Enter your password to unlock</div>
-
-      <input
-        type="password"
-        value={pw}
-        autoFocus
-        onChange={e => { setPw(e.target.value); setErr(null); }}
-        onKeyDown={e => e.key === "Enter" && submit()}
-        placeholder="Password"
-        className={err ? "shake" : ""}
-        style={{background:"#1c1c1e",border:err?"1px solid #ff375f":"1px solid #2c2c2e",color:"#fff",borderRadius:14,padding:"16px 18px",width:"100%",fontFamily:"inherit",fontSize:17,letterSpacing:"-.3px",outline:"none",marginBottom:12}}
-      />
-
-      {err && <div style={{color:"#ff375f",fontSize:14,marginBottom:12,textAlign:"center"}}>{err}</div>}
-
-      <button
-        onClick={submit}
-        disabled={busy || !pw}
-        style={{background:"#c5f135",color:"#000",border:"none",borderRadius:14,padding:16,width:"100%",fontFamily:"inherit",fontSize:17,fontWeight:600,letterSpacing:"-.3px",cursor:"pointer",opacity:(busy||!pw)?.4:1,transition:"opacity .15s"}}>
-        {busy ? "Unlocking…" : "Unlock"}
+      <div style={{fontSize:15,color:"#636366",marginBottom:36}}>Enter your password to unlock</div>
+      <input type="password" value={pw} autoFocus onChange={e=>{setPw(e.target.value);setErr(null);}}
+        onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="Password" className={err?"shake":""}
+        style={{background:"#1c1c1e",border:err?"1px solid #ff375f":"1px solid #2c2c2e",color:"#fff",borderRadius:14,padding:"16px 18px",width:"100%",fontFamily:"inherit",fontSize:17,outline:"none",marginBottom:12}}/>
+      {err && <div style={{color:"#ff375f",fontSize:14,marginBottom:12}}>{err}</div>}
+      <button onClick={submit} disabled={busy||!pw}
+        style={{background:"#c5f135",color:"#000",border:"none",borderRadius:14,padding:16,width:"100%",fontFamily:"inherit",fontSize:17,fontWeight:600,cursor:"pointer",opacity:(busy||!pw)?.4:1}}>
+        {busy?"Unlocking…":"Unlock"}
       </button>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PLAID BUTTON
-// ═══════════════════════════════════════════════════════════════════════════════
-function PlaidButton({ onLinked, onError }) {
+// ═════════════════════════════════════════════════════════════════════════════
+function PlaidButton({ onLinked, onError, label = "🏦  Connect Your Bank" }) {
   const [linkToken, setLinkToken] = useState(null);
   const [busy, setBusy] = useState(false);
-
   useEffect(() => {
-    api("/api/create_link_token")
-      .then(async r => {
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.plaid?.error_code || d.error || "Failed");
-        setLinkToken(d.link_token);
-      })
-      .catch(e => onError?.(e.message));
+    api("/api/create_link_token").then(async r => {
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.plaid?.error_code || d.error || "Failed");
+      setLinkToken(d.link_token);
+    }).catch(e => onError?.(e.message));
   }, [onError]);
-
   const { open, ready } = usePlaidLink({
     token: linkToken,
     onSuccess: async (public_token) => {
       setBusy(true);
       try {
-        // We hand over the public_token and get back nothing but {ok:true}.
-        // The access token never comes down here.
         const r = await api("/api/exchange_public_token", { public_token });
-        if (!r.ok) {
-          const d = await r.json().catch(() => ({}));
-          throw new Error(d.plaid?.error_code || d.error || "Link failed");
-        }
+        if (!r.ok) { const d = await r.json().catch(()=>({})); throw new Error(d.plaid?.error_code || d.error); }
         onLinked();
-      } catch (e) {
-        onError?.(e.message);
-      }
+      } catch (e) { onError?.(e.message); }
       setBusy(false);
     },
   });
-
   return (
-    <button className="btn-green" onClick={() => open()} disabled={!ready || busy}
-      style={{ opacity: (!ready || busy) ? .5 : 1 }}>
-      {busy ? "Linking…" : !ready ? "Loading…" : "🏦  Connect Your Bank"}
+    <button className="btn-green" onClick={()=>open()} disabled={!ready||busy} style={{opacity:(!ready||busy)?.5:1}}>
+      {busy?"Linking…":!ready?"Loading…":label}
     </button>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MAIN APP
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═════════════════════════════════════════════════════════════════════════════
 export default function App() {
-  // ── auth state ──
-  const [authState, setAuthState] = useState("checking"); // checking | locked | unlocked
+  const [authState, setAuthState] = useState("checking");
   const [bankConnected, setBankConnected] = useState(false);
 
-  const [tab, setTab] = useState("dashboard");
-  const [envelopes, setEnvelopes] = usePersisted("bg_envelopes", DEFAULT_ENVELOPES);
-  const [bills, setBills] = usePersisted("bg_bills", DEFAULT_BILLS);
+  const [tab, setTab] = useState("home");
+  const [envelopes, setEnvelopes]       = usePersisted("bg_envelopes", []);   // ← empty. no fake data.
   const [transactions, setTransactions] = usePersisted("bg_transactions", []);
-  const [accounts, setAccounts] = usePersisted("bg_accounts", []);
-  const [lastSync, setLastSync] = usePersisted("bg_last_sync", null);
-  const [unmapped, setUnmapped] = usePersisted("bg_unmapped", []);
+  const [accounts, setAccounts]         = usePersisted("bg_accounts", []);
+  const [unmapped, setUnmapped]         = usePersisted("bg_unmapped", []);
+  const [lastSync, setLastSync]         = usePersisted("bg_last_sync", null);
 
   const [syncing, setSyncing] = useState(false);
-  const [showAddEnv, setShowAddEnv] = useState(false);
-  const [showAddBill, setShowAddBill] = useState(false);
-  const [showAddTx, setShowAddTx] = useState(false);
-  const [payModal, setPayModal] = useState(null);
-  const [mapModal, setMapModal] = useState(null);
   const [toast, setToast] = useState(null);
+  const [editEnv, setEditEnv] = useState(null);       // envelope being created/edited
+  const [detailEnv, setDetailEnv] = useState(null);   // envelope detail sheet
+  const [fundEnv, setFundEnv] = useState(null);       // fund/unfund sheet
+  const [mapTx, setMapTx] = useState(null);           // assign-transaction sheet
 
-  const [newEnv, setNewEnv] = useState({name:"",budget:"",icon:"💰",color:"#0a84ff"});
-  const [newBill, setNewBill] = useState({name:"",amount:"",dueDay:"",envelopeId:"",category:"Other"});
-  const [newTx, setNewTx] = useState({desc:"",amount:"",envelopeId:"",date:new Date().toISOString().split("T")[0]});
+  const checkingBalance = useMemo(
+    () => accounts.filter(a => a.type === "depository" && a.subtype !== "savings")
+                  .reduce((s,a) => s + (a.available ?? a.balance ?? 0), 0),
+    [accounts]
+  );
 
-  // ── Check session on load ──
+  const sts     = safeToSpend(envelopes, checkingBalance);
+  const alerts  = useMemo(() => buildAlerts(envelopes, transactions, checkingBalance), [envelopes, transactions, checkingBalance]);
+  const locks   = useMemo(() => upcomingLocks(envelopes, transactions), [envelopes, transactions]);
+  const bills   = envelopes.filter(e => isBill(e.type));
+  const debts   = envelopes.filter(e => e.type === TYPES.DEBT);
+
+  function showToast(m) { setToast(m); setTimeout(()=>setToast(null), 3200); }
+
+  // ── session ──
   const checkSession = useCallback(async () => {
     try {
       const r = await fetch("/api/session", { credentials: "same-origin" });
       const d = await r.json();
       setAuthState(d.authenticated ? "unlocked" : "locked");
       setBankConnected(Boolean(d.bankConnected));
-    } catch {
-      setAuthState("locked");
-    }
+    } catch { setAuthState("locked"); }
   }, []);
-
   useEffect(() => { checkSession(); }, [checkSession]);
 
-  function showToast(msg) { setToast(msg); setTimeout(() => setToast(null), 3000); }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AUTO-FUND ON LOCK DAY
+  //
+  // When an autopay envelope's lock window opens, we pull from Safe to Spend to
+  // fill it — up to what it needs, or up to what's actually there. If there
+  // isn't enough, we fund what we can and let the alert scream about it. The
+  // money is leaving the account either way; the envelope should say so.
+  // ═══════════════════════════════════════════════════════════════════════════
+  useEffect(() => {
+    if (authState !== "unlocked" || !envelopes.length) return;
 
-  async function logout() {
-    await api("/api/logout").catch(() => {});
-    setAuthState("locked");
-  }
+    let available = sts;
+    let changed = false;
+    const next = envelopes.map(env => {
+      if (!env.autopay || !isBill(env.type)) return env;
+      if (isPaid(env, transactions)) return env;
+      if (!isLocked(env, transactions)) return env;
 
-  const totalBudget = envelopes.reduce((s,e) => s+e.budget, 0);
-  const totalSpent  = envelopes.reduce((s,e) => s+e.spent, 0);
-  const totalLeft   = totalBudget - totalSpent;
-  const pct = Math.min((totalSpent/totalBudget)*100, 100);
-  const unpaidBills = bills.filter(b => !b.paid).sort((a,b) => getDays(a.dueDay)-getDays(b.dueDay));
-  const totalBalance = accounts.filter(a => a.type === "depository").reduce((s,a) => s+(a.available||a.balance||0), 0);
+      const need = targetAmount(env) - (env.funded || 0);
+      if (need <= 0) return env;
 
-  // ── Sync: no token passed. The server knows who we are and looks it up. ──
+      const grab = Math.min(need, Math.max(0, available));
+      if (grab <= 0) return env;
+
+      available -= grab;
+      changed = true;
+      return { ...env, funded: (env.funded || 0) + grab };
+    });
+
+    if (changed) setEnvelopes(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authState, envelopes.length, transactions.length]);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SYNC — the moment reality overwrites the plan
+  // ═══════════════════════════════════════════════════════════════════════════
   const syncBank = useCallback(async () => {
     setSyncing(true);
     try {
       const r = await api("/api/get_transactions");
-
       if (r.status === 401) { setAuthState("locked"); setSyncing(false); return; }
-
       const d = await r.json();
-
       if (!r.ok) {
-        if (d.code === "RELINK") {
-          setBankConnected(false);
-          showToast("Bank needs re-linking");
-        } else if (d.code === "NO_BANK") {
-          setBankConnected(false);
-          showToast("No bank connected");
-        } else {
-          showToast(d.plaid?.error_code || "Sync failed");
-        }
-        setSyncing(false);
-        return;
+        if (d.code === "RELINK") { setBankConnected(false); showToast("Bank needs re-linking"); }
+        else if (d.code === "NO_BANK") { setBankConnected(false); showToast("No bank connected"); }
+        else showToast(d.plaid?.error_code || "Sync failed");
+        setSyncing(false); return;
       }
 
       setAccounts(d.accounts || []);
 
-      const existing = new Set(transactions.map(t => t.id));
-      const fresh = (d.transactions || []).filter(t => !existing.has(t.id) && !t.pending);
+      const seen = new Set(transactions.map(t => t.id));
+      const fresh = (d.transactions || []).filter(t => !seen.has(t.id) && !t.pending);
 
-      const mapped = [], needsMap = [];
+      const matched = [], needsAssign = [];
       fresh.forEach(t => {
-        const envId = guessEnvelope(t);
-        if (envId) mapped.push({ ...t, envelopeId: envId });
-        else needsMap.push(t);
+        const envId = matchEnvelope(t, envelopes);
+        if (envId) matched.push({ ...t, envelopeId: envId });
+        else needsAssign.push(t);
       });
 
-      if (mapped.length) {
-        setTransactions(p => [...mapped, ...p]);
-        setEnvelopes(p => p.map(env => {
-          const added = mapped.filter(t => t.envelopeId === env.id).reduce((s,t) => s+t.amount, 0);
-          return added ? { ...env, spent: env.spent + added } : env;
-        }));
+      if (matched.length) {
+        setTransactions(p => [...matched, ...p]);
+        setEnvelopes(p => p.map(env => applyPayments(env, matched.filter(t => t.envelopeId === env.id))));
       }
-      if (needsMap.length) setUnmapped(p => [...needsMap, ...p]);
+      if (needsAssign.length) setUnmapped(p => [...needsAssign, ...p]);
 
       setLastSync(new Date().toISOString());
-      showToast(`Synced — ${fresh.length} new transaction${fresh.length !== 1 ? "s" : ""}`);
-    } catch (e) {
-      showToast("Sync failed");
-    }
+      showToast(`Synced — ${fresh.length} new`);
+    } catch { showToast("Sync failed"); }
     setSyncing(false);
-  }, [transactions, setTransactions, setEnvelopes, setAccounts, setLastSync, setUnmapped]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transactions, envelopes]);
 
-  async function handleLinked() {
-    setBankConnected(true);
-    showToast("Bank connected");
-    await syncBank();
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE RELEASE MECHANIC — the heart of it
+  //
+  // Amex envelope funded $1,000. Payment clears for $600.
+  //
+  //   • balance drops by the REAL $600, not the planned $1,000
+  //   • the envelope settles: funded → 0
+  //   • the unspent $400 stops being reserved, so Safe to Spend rises by $400
+  //
+  // You never correct anything. You never remember anything. The bank told us
+  // what happened and the budget rearranged itself around it.
+  // ═══════════════════════════════════════════════════════════════════════════
+  function applyPayments(env, payments) {
+    if (!payments.length) return env;
+    const total = payments.reduce((s,t) => s + t.amount, 0);
+    let next = { ...env };
+
+    if (env.type === TYPES.DEBT) {
+      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
+    } else if (env.type === TYPES.GOAL) {
+      next.currentBalance = (env.currentBalance || 0) + total;
+    }
+
+    // Settle: release whatever was reserved but not spent.
+    if (isBill(env.type)) next.funded = 0;
+    else next.funded = Math.max(0, (env.funded || 0) - total);
+
+    return next;
   }
 
-  async function disconnectBank() {
-    await api("/api/disconnect_bank").catch(() => {});
-    setBankConnected(false);
-    setAccounts([]);
-    showToast("Bank disconnected");
+  // ── funding ──
+  function fund(envId, amount) {
+    if (amount <= 0) return;
+    if (amount > sts) { showToast("Not enough safe to spend"); return; }
+    setEnvelopes(p => p.map(e => e.id === envId ? { ...e, funded: (e.funded||0) + amount } : e));
+    showToast(`Funded ${money(amount)}`);
+  }
+  function unfund(envId, amount) {
+    const env = envelopes.find(e => e.id === envId);
+    if (!env) return;
+    if (isLocked(env, transactions)) { showToast("🔒 Locked — autopay is in flight"); return; }
+    const take = Math.min(amount, env.funded || 0);
+    setEnvelopes(p => p.map(e => e.id === envId ? { ...e, funded: (e.funded||0) - take } : e));
+    showToast(`Released ${money(take)}`);
   }
 
-  function assignUnmapped(tx, envId) {
-    setTransactions(p => [{ ...tx, envelopeId: envId }, ...p]);
-    setEnvelopes(p => p.map(e => e.id === envId ? { ...e, spent: e.spent + tx.amount } : e));
+  // ── envelopes ──
+  function saveEnvelope(data) {
+    if (data.id) {
+      setEnvelopes(p => p.map(e => e.id === data.id ? { ...e, ...data } : e));
+      showToast("Envelope updated");
+    } else {
+      const created = {
+        ...data,
+        id: `env_${Date.now()}`,
+        funded: 0,
+        matchPatterns: data.matchPatterns || [],
+      };
+      if (data.type === TYPES.DEBT) {
+        created.originalBalance = data.currentBalance;
+        created.startDate = new Date().toISOString().split("T")[0];
+      }
+      setEnvelopes(p => [...p, created]);
+      showToast("Envelope created");
+    }
+    setEditEnv(null);
+  }
+
+  function deleteEnvelope(id) {
+    const env = envelopes.find(e => e.id === id);
+    if (env && isLocked(env, transactions)) { showToast("🔒 Can't delete — autopay locked"); return; }
+    setEnvelopes(p => p.filter(e => e.id !== id));
+    setTransactions(p => p.map(t => t.envelopeId === id ? { ...t, envelopeId: null } : t));
+    setDetailEnv(null);
+    showToast("Envelope deleted");
+  }
+
+  // ── assign a transaction, and optionally teach the matcher ──
+  function assignTx(tx, envId, remember) {
+    const assigned = { ...tx, envelopeId: envId };
+    setTransactions(p => [assigned, ...p]);
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== envId) return e;
+      let next = applyPayments(e, [assigned]);
+      if (remember) {
+        const pattern = normalizeMerchant(tx.desc);
+        if (pattern && !(next.matchPatterns||[]).includes(pattern)) {
+          next.matchPatterns = [...(next.matchPatterns||[]), pattern];
+        }
+      }
+      return next;
+    }));
     setUnmapped(p => p.filter(t => t.id !== tx.id));
-    setMapModal(null); showToast("Transaction assigned");
+    setMapTx(null);
+    showToast(remember ? "Assigned — will auto-match next time" : "Assigned");
   }
 
-  function payBill(bill) {
-    setBills(p => p.map(b => b.id === bill.id ? { ...b, paid: true } : b));
-    setEnvelopes(p => p.map(e => e.id === bill.envelopeId ? { ...e, spent: e.spent + bill.amount } : e));
-    setTransactions(p => [{ id:`bill-${Date.now()}`, desc:bill.name, amount:bill.amount, envelopeId:bill.envelopeId, date:new Date().toISOString().split("T")[0], type:"bill" }, ...p]);
-    setPayModal(null); showToast(`${bill.name} paid`);
+  function markPaid(env) {
+    setEnvelopes(p => p.map(e => e.id === env.id ? { ...e, manualPaidPeriod: periodKey(env), funded: 0 } : e));
+    showToast("Marked as paid");
   }
 
-  function addEnvelope() {
-    if (!newEnv.name || !newEnv.budget) return;
-    setEnvelopes(p => [...p, { id:Date.now(), name:newEnv.name, budget:parseFloat(newEnv.budget), spent:0, color:newEnv.color, icon:newEnv.icon }]);
-    setNewEnv({name:"",budget:"",icon:"💰",color:"#0a84ff"}); setShowAddEnv(false); showToast("Envelope created");
-  }
-  function addBill() {
-    if (!newBill.name || !newBill.amount || !newBill.dueDay) return;
-    setBills(p => [...p, { id:Date.now(), ...newBill, amount:parseFloat(newBill.amount), dueDay:parseInt(newBill.dueDay), envelopeId:parseInt(newBill.envelopeId)||null, paid:false }]);
-    setNewBill({name:"",amount:"",dueDay:"",envelopeId:"",category:"Other"}); setShowAddBill(false); showToast("Bill added");
-  }
-  function addManualTx() {
-    if (!newTx.desc || !newTx.amount || !newTx.envelopeId) return;
-    const amt = parseFloat(newTx.amount);
-    setEnvelopes(p => p.map(e => e.id === parseInt(newTx.envelopeId) ? { ...e, spent: e.spent + amt } : e));
-    setTransactions(p => [{ id:`man-${Date.now()}`, ...newTx, amount:amt, envelopeId:parseInt(newTx.envelopeId), type:"manual" }, ...p]);
-    setNewTx({desc:"",amount:"",envelopeId:"",date:new Date().toISOString().split("T")[0]}); setShowAddTx(false); showToast("Expense logged");
-  }
+  async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
+  async function logout() { await api("/api/logout").catch(()=>{}); setAuthState("locked"); }
 
-  const fmtSync = lastSync ? new Date(lastSync).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}) : null;
-
-  // ── Gate everything behind auth ──
-  if (authState === "checking") {
-    return (
-      <div style={{background:"#000",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}>
-        <div style={{fontSize:44,opacity:.35}}>🍬</div>
-      </div>
-    );
-  }
-  if (authState === "locked") {
-    return <LockScreen onUnlock={checkSession} />;
-  }
+  // ── gates ──
+  if (authState === "checking")
+    return <div style={{background:"#000",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{fontSize:44,opacity:.35}}>🍬</div></div>;
+  if (authState === "locked") return <LockScreen onUnlock={checkSession} />;
 
   return (
-    <div style={{fontFamily:"-apple-system,'SF Pro Display','SF Pro Text','Helvetica Neue',sans-serif",background:"#000",minHeight:"100vh",color:"#fff",maxWidth:430,margin:"0 auto",position:"relative",WebkitFontSmoothing:"antialiased"}}>
-      <style>{`
-        *{box-sizing:border-box;margin:0;padding:0}
-        ::-webkit-scrollbar{display:none}
-        input::placeholder{color:#48484a}
-        input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.4)}
-        button{-webkit-tap-highlight-color:transparent}
-        @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-        @keyframes sheetUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
-        @keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-        .card{background:#1c1c1e;border-radius:20px}
-        .grp{background:#1c1c1e;border-radius:16px;overflow:hidden}
-        .row{padding:14px 16px;display:flex;align-items:center;gap:12px}
-        .row+.row{border-top:.5px solid rgba(255,255,255,.1)}
-        .input{background:#2c2c2e;border:none;color:#fff;border-radius:12px;padding:14px 16px;width:100%;font-family:inherit;font-size:17px;letter-spacing:-.3px;transition:background .15s}
-        .input:focus{background:#3a3a3c;outline:none}
-        select.input option{background:#2c2c2e}
-        .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;flex-direction:column;justify-content:flex-end;animation:fadeIn .2s;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-        .sheet{background:#1c1c1e;border-radius:20px 20px 0 0;width:100%;max-width:430px;margin:0 auto;animation:sheetUp .32s cubic-bezier(.32,1,.23,1);max-height:88vh;overflow-y:auto}
-        .btn-green{background:#c5f135;color:#000;border:none;border-radius:14px;font-family:inherit;font-size:17px;font-weight:600;letter-spacing:-.3px;padding:16px;cursor:pointer;width:100%;transition:opacity .12s}
-        .btn-green:active{opacity:.72}
-        .btn-dim{background:#2c2c2e;color:#fff;border:none;border-radius:14px;font-family:inherit;font-size:15px;font-weight:500;padding:14px;cursor:pointer;width:100%;transition:opacity .12s}
-        .btn-dim:active{opacity:.6}
-        .link{background:none;border:none;color:#c5f135;font-family:inherit;font-size:17px;font-weight:600;cursor:pointer;letter-spacing:-.3px;transition:opacity .12s}
-        .link:active{opacity:.5}
-        .row-tap{background:none;border:none;width:100%;text-align:left;cursor:pointer;padding:0;font-family:inherit;color:inherit;transition:opacity .12s}
-        .row-tap:active{opacity:.5}
-        .pay-chip{background:#c5f135;color:#000;border:none;border-radius:20px;padding:6px 15px;font-size:14px;font-weight:700;cursor:pointer;transition:opacity .12s}
-        .pay-chip:active{opacity:.7}
-        .badge{background:#ff375f;border-radius:10px;padding:2px 7px;font-size:12px;font-weight:700;color:#fff}
-        .sec-label{font-size:13px;font-weight:600;color:#636366;text-transform:uppercase;letter-spacing:.6px}
-      `}</style>
+    <div style={S.app}>
+      <style>{CSS}</style>
 
-      {toast && <div style={{position:"fixed",bottom:96,left:"50%",transform:"translateX(-50%)",background:"rgba(44,44,46,.96)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",borderRadius:22,padding:"11px 20px",fontSize:15,fontWeight:500,whiteSpace:"nowrap",zIndex:200,animation:"toastIn .28s cubic-bezier(.32,1,.23,1)",letterSpacing:"-.3px"}}>{toast}</div>}
+      {toast && <div className="toast">{toast}</div>}
 
-      <div style={{height:20}}/>
-
-      {/* HEADER */}
-      <div style={{padding:"0 22px"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+      {/* ═══ HEADER — Safe to Spend is the hero number ═══ */}
+      <div style={{padding:"24px 22px 0"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
           <div>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
-              <span style={{fontSize:13,fontWeight:600,color:"#636366",letterSpacing:".4px",textTransform:"uppercase"}}>🍬 Budgetgum</span>
-              <button onClick={logout} style={{background:"none",border:"none",color:"#48484a",fontSize:11,cursor:"pointer",fontFamily:"inherit",padding:0,textDecoration:"underline"}}>Lock</button>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              <span className="eyebrow">🍬 Budgetgum</span>
+              <button onClick={logout} className="tiny-link">Lock</button>
             </div>
-            <div style={{fontSize:42,fontWeight:700,letterSpacing:"-2px",lineHeight:1,color:totalLeft>=0?"#c5f135":"#ff375f"}}>{fmt(totalLeft)}</div>
-            <div style={{fontSize:15,color:"#636366",marginTop:5,letterSpacing:"-.2px"}}>available to spend</div>
+            <div style={{fontSize:44,fontWeight:700,letterSpacing:"-2.2px",lineHeight:1,color:sts>=0?"#c5f135":"#ff375f"}}>
+              {money(sts)}
+            </div>
+            <div style={{fontSize:15,color:"#636366",marginTop:5}}>safe to spend</div>
           </div>
-          <div style={{textAlign:"right",paddingTop:6}}>
-            {bankConnected && accounts.length > 0 ? (
+          <div style={{textAlign:"right",paddingTop:4}}>
+            {bankConnected ? (
               <>
-                <div style={{fontSize:13,fontWeight:500,color:"#636366",letterSpacing:".4px",textTransform:"uppercase",marginBottom:5}}>Bank Balance</div>
-                <div style={{fontSize:24,fontWeight:700,letterSpacing:"-1px",color:"#30d158"}}>{fmt(totalBalance)}</div>
-                <button onClick={syncBank} disabled={syncing} style={{background:"none",border:"none",color:syncing?"#636366":"#0a84ff",fontSize:13,fontWeight:500,cursor:"pointer",marginTop:3,padding:0,fontFamily:"inherit"}}>
-                  {syncing ? "Syncing…" : fmtSync ? `Synced ${fmtSync}` : "Sync now"}
+                <div className="eyebrow" style={{marginBottom:5}}>In Checking</div>
+                <div style={{fontSize:22,fontWeight:700,letterSpacing:"-1px"}}>{money(checkingBalance)}</div>
+                <div style={{fontSize:12,color:"#636366",marginTop:2}}>{money(envelopes.reduce((s,e)=>s+(e.funded||0),0))} reserved</div>
+                <button onClick={syncBank} disabled={syncing} className="tiny-link" style={{color:syncing?"#48484a":"#0a84ff",marginTop:4}}>
+                  {syncing ? "Syncing…" : "Sync"}
                 </button>
               </>
             ) : (
-              <>
-                <div style={{fontSize:13,fontWeight:500,color:"#636366",letterSpacing:".4px",textTransform:"uppercase",marginBottom:5}}>Budget</div>
-                <div style={{fontSize:24,fontWeight:700,letterSpacing:"-1px"}}>{fmt(totalBudget)}</div>
-                <div style={{fontSize:13,color:"#636366",marginTop:3}}>spent {fmt(totalSpent)}</div>
-              </>
+              <div style={{fontSize:12,color:"#48484a",maxWidth:110,textAlign:"right"}}>Connect a bank to see real balances</div>
             )}
           </div>
         </div>
 
-        {bankConnected && accounts.length > 0 && (
-          <div style={{display:"flex",gap:8,marginBottom:14,overflowX:"auto",paddingBottom:2}}>
-            {accounts.map(a => (
-              <div key={a.id} style={{background:"#1c1c1e",borderRadius:12,padding:"8px 14px",flexShrink:0}}>
-                <div style={{fontSize:12,color:"#636366",marginBottom:2}}>{a.name} ····{a.mask}</div>
-                <div style={{fontSize:16,fontWeight:700,letterSpacing:"-.5px",color:a.type==="credit"?"#ff375f":"#fff"}}>{fmt(a.available||a.balance)}</div>
-              </div>
-            ))}
-          </div>
-        )}
-
         {!bankConnected && (
-          <div className="card" style={{padding:"16px 18px",marginBottom:14,border:"1px solid #30d15840"}}>
-            <div style={{fontSize:15,fontWeight:600,letterSpacing:"-.3px",marginBottom:4}}>Connect Your Bank</div>
-            <div style={{fontSize:13,color:"#636366",marginBottom:14,lineHeight:1.5}}>
-              Your credentials go directly to Plaid and are never stored by Budgetgum.
+          <div className="card" style={{padding:16,marginTop:16,border:"1px solid #30d15840"}}>
+            <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>Connect Your Bank</div>
+            <div style={{fontSize:13,color:"#636366",marginBottom:12,lineHeight:1.5}}>
+              Safe to Spend is your real checking balance minus what you've reserved. Without a bank, it's guesswork.
             </div>
-            <PlaidButton onLinked={handleLinked} onError={msg => showToast(msg)} />
+            <PlaidButton onLinked={handleLinked} onError={showToast} />
           </div>
         )}
 
-        {unmapped.length > 0 && (
-          <button className="row-tap card" style={{padding:"12px 16px",marginBottom:14,width:"100%",display:"flex",alignItems:"center",gap:12,border:"1px solid #ffd60a40"}} onClick={() => setMapModal(unmapped[0])}>
-            <div style={{fontSize:24}}>📥</div>
-            <div style={{flex:1}}>
-              <div style={{fontSize:15,fontWeight:600,letterSpacing:"-.3px"}}>Transactions to assign</div>
-              <div style={{fontSize:13,color:"#636366",marginTop:1}}>Tap to sort into envelopes</div>
-            </div>
-            <span className="badge">{unmapped.length}</span>
-          </button>
-        )}
-
-        <div className="card" style={{padding:"14px 16px",marginBottom:6}}>
-          <div style={{display:"flex",justifyContent:"space-between",marginBottom:9,fontSize:13,fontWeight:500,letterSpacing:"-.2px"}}>
-            <span style={{color:"#aeaeb2"}}>Monthly progress</span>
-            <span style={{color:pct>90?"#ff375f":pct>70?"#ffd60a":"#c5f135"}}>{Math.round(pct)}%</span>
-          </div>
-          <div style={{background:"#2c2c2e",borderRadius:5,height:5,overflow:"hidden"}}>
-            <div style={{height:"100%",width:`${pct}%`,background:pct>90?"linear-gradient(90deg,#ff375f,#ff6961)":pct>70?"linear-gradient(90deg,#ffd60a,#ff9f0a)":"linear-gradient(90deg,#c5f135,#30d158)",borderRadius:5,transition:"width 1s ease"}}/>
-          </div>
-        </div>
-
-        <div style={{display:"flex",borderBottom:".5px solid rgba(255,255,255,.1)",marginTop:18}}>
-          {[["dashboard","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,label]) => (
-            <button key={t} onClick={() => setTab(t)} style={{flex:1,background:"none",border:"none",borderBottom:tab===t?"2px solid #c5f135":"2px solid transparent",paddingBottom:10,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3,color:tab===t?"#c5f135":"#636366",transition:"color .15s",fontSize:10,fontWeight:500,letterSpacing:".4px",textTransform:"uppercase"}}>
-              <span style={{fontSize:18}}>{ic}</span>{label}
+        <div className="tabs">
+          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+            <button key={t} onClick={()=>setTab(t)} className={`tab ${tab===t?"on":""}`}>
+              <span style={{fontSize:18}}>{ic}</span>{l}
             </button>
           ))}
         </div>
       </div>
 
-      {/* DASHBOARD */}
-      {tab === "dashboard" && (
-        <div style={{padding:"20px 22px 110px"}}>
-          {unpaidBills.filter(b => getDays(b.dueDay) <= 7).length > 0 && (
+      {/* ═══ HOME ═══ */}
+      {tab === "home" && (
+        <div style={S.page}>
+          {/* Alerts — critical first */}
+          {alerts.length > 0 && (
             <div style={{marginBottom:24}}>
-              <div className="sec-label" style={{marginBottom:10}}>Coming Up</div>
-              <div className="grp">
-                {unpaidBills.filter(b => getDays(b.dueDay) <= 7).map(bill => {
-                  const days = getDays(bill.dueDay), env = envelopes.find(e => e.id === bill.envelopeId);
-                  return (
-                    <div key={bill.id} className="row">
-                      <div style={{width:38,height:38,borderRadius:11,background:urgency(days)+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>{env?.icon||"📄"}</div>
-                      <div style={{flex:1}}>
-                        <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px"}}>{bill.name}</div>
-                        <div style={{fontSize:13,color:urgency(days),fontWeight:500,marginTop:2}}>{days===0?"Due today":`${days} days`}</div>
+              {alerts.slice(0,4).map((a,i) => (
+                <button key={i} className={`alert ${a.level}`} onClick={()=>setDetailEnv(a.env)}>
+                  <span style={{fontSize:18,flexShrink:0}}>
+                    {a.level==="critical"?"🚨":a.level==="warn"?"⚠️":"🔔"}
+                  </span>
+                  <div style={{flex:1,textAlign:"left"}}>
+                    <div style={{fontSize:14,fontWeight:600,letterSpacing:"-.2px"}}>{a.title}</div>
+                    <div style={{fontSize:12,color:"#aeaeb2",marginTop:2,lineHeight:1.4}}>{a.body}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* ── THE FORECAST — the screen that does the real work ── */}
+          {locks.length > 0 && (
+            <div style={{marginBottom:24}}>
+              <div className="sec">Locking Soon</div>
+              <div className="card" style={{padding:16}}>
+                <div style={{fontSize:13,color:"#8e8e93",marginBottom:12,lineHeight:1.5}}>
+                  Autopay pulls funds days before the due date. Once locked, that money can't be moved.
+                </div>
+                {locks.map(({env,lockIn,needs,has,short}) => (
+                  <div key={env.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"0.5px solid rgba(255,255,255,.07)"}}>
+                    <span style={{fontSize:18}}>{env.icon}</span>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:14,fontWeight:500}}>{env.name}</div>
+                      <div style={{fontSize:12,color:short>0?"#ffd60a":"#30d158",marginTop:1}}>
+                        {money(has)} of {money(needs)}{short>0?` · ${money(short)} short`:" · ready"}
                       </div>
-                      <div style={{fontSize:17,fontWeight:600,letterSpacing:"-.5px",marginRight:10}}>{fmt(bill.amount)}</div>
-                      <button className="pay-chip" onClick={() => setPayModal(bill)}>Pay</button>
                     </div>
-                  );
-                })}
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:13,fontWeight:700,color:lockIn<=1?"#ff375f":lockIn<=3?"#ffd60a":"#8e8e93"}}>
+                        {lockIn===0?"TODAY":`${lockIn}d`}
+                      </div>
+                      <div style={{fontSize:10,color:"#48484a",letterSpacing:".4px"}}>TO LOCK</div>
+                    </div>
+                  </div>
+                ))}
+                <div style={{display:"flex",justifyContent:"space-between",paddingTop:12,fontSize:13}}>
+                  <span style={{color:"#8e8e93"}}>Safe to Spend after locks</span>
+                  <span style={{fontWeight:700,color:(sts - locks.reduce((s,l)=>s+l.short,0))>=0?"#c5f135":"#ff375f"}}>
+                    {money(sts - locks.reduce((s,l)=>s+l.short,0))}
+                  </span>
+                </div>
               </div>
             </div>
           )}
 
-          <div className="sec-label" style={{marginBottom:10}}>Envelopes</div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:24}}>
-            {envelopes.map(env => {
-              const p = Math.min((env.spent/env.budget)*100, 100), left = env.budget - env.spent;
-              return (
-                <button key={env.id} className="row-tap card" style={{padding:16,textAlign:"left"}} onClick={() => setTab("envelopes")}>
-                  <div style={{fontSize:28,marginBottom:10}}>{env.icon}</div>
-                  <div style={{fontSize:13,color:"#636366",fontWeight:500,letterSpacing:"-.2px",marginBottom:2}}>{env.name}</div>
-                  <div style={{fontSize:22,fontWeight:700,letterSpacing:"-1px",color:left>=0?"#fff":"#ff375f",lineHeight:1.1}}>{fmt(left)}</div>
-                  <div style={{fontSize:12,color:"#48484a",marginBottom:10}}>of {fmt(env.budget)}</div>
-                  <div style={{background:"#2c2c2e",borderRadius:3,height:3,overflow:"hidden"}}>
-                    <div style={{height:"100%",width:`${p}%`,background:p>90?"#ff375f":p>70?"#ffd60a":env.color,borderRadius:3,transition:"width 1s ease"}}/>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="sec-label" style={{marginBottom:10}}>Recent</div>
-          <div className="grp">
-            {transactions.length === 0 && <div style={{padding:"20px 16px",textAlign:"center",fontSize:14,color:"#48484a"}}>No transactions yet.</div>}
-            {transactions.slice(0,6).map(tx => {
-              const env = envelopes.find(e => e.id === tx.envelopeId);
-              return (
-                <div key={tx.id} className="row">
-                  <div style={{width:34,height:34,borderRadius:10,background:env?env.color+"22":"#2c2c2e",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0}}>{env?.icon||"💸"}</div>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px"}}>{tx.desc}</div>
-                    <div style={{fontSize:13,color:"#636366",marginTop:1}}>{env?.name||"—"} · {tx.date}</div>
-                  </div>
-                  <div style={{fontSize:16,fontWeight:600,letterSpacing:"-.4px",color:"#aeaeb2"}}>−{fmt(tx.amount)}</div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* ENVELOPES */}
-      {tab === "envelopes" && (
-        <div style={{padding:"20px 22px 110px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-            <div className="sec-label">All Envelopes</div>
-            <button className="link" style={{fontSize:15}} onClick={() => setShowAddEnv(true)}>+ New</button>
-          </div>
-          {envelopes.map(env => {
-            const p = Math.min((env.spent/env.budget)*100, 100), left = env.budget - env.spent;
-            const envTxs = transactions.filter(t => t.envelopeId === env.id);
-            return (
-              <div key={env.id} className="card" style={{padding:18,marginBottom:10}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                  <div style={{display:"flex",alignItems:"center",gap:12}}>
-                    <div style={{width:42,height:42,borderRadius:13,background:env.color+"22",border:`1px solid ${env.color}33`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22}}>{env.icon}</div>
-                    <div>
-                      <div style={{fontSize:17,fontWeight:600,letterSpacing:"-.4px"}}>{env.name}</div>
-                      <div style={{fontSize:13,color:"#636366",marginTop:1}}>{envTxs.length} transaction{envTxs.length!==1?"s":""}</div>
-                    </div>
-                  </div>
-                  <div style={{textAlign:"right"}}>
-                    <div style={{fontSize:20,fontWeight:700,letterSpacing:"-1px",color:left>=0?"#fff":"#ff375f"}}>{fmt(left)}</div>
-                    <div style={{fontSize:12,color:"#636366"}}>of {fmt(env.budget)}</div>
-                  </div>
-                </div>
-                <div style={{background:"#2c2c2e",borderRadius:4,height:5,overflow:"hidden",marginBottom:10}}>
-                  <div style={{height:"100%",width:`${p}%`,background:p>90?"#ff375f":p>70?"#ffd60a":env.color,borderRadius:4,transition:"width 1s ease"}}/>
-                </div>
-                <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#636366",marginBottom:envTxs.length?12:0}}>
-                  <span>Spent {fmt(env.spent)}</span>
-                  <span style={{color:p>90?"#ff375f":"#636366"}}>{Math.round(p)}%</span>
-                </div>
-                {envTxs.length > 0 && (
-                  <div style={{borderTop:".5px solid rgba(255,255,255,.08)",paddingTop:10,marginBottom:12}}>
-                    {envTxs.slice(0,3).map(tx => (
-                      <div key={tx.id} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:14}}>
-                        <span style={{color:"#636366"}}>{tx.desc}</span>
-                        <span style={{color:"#aeaeb2"}}>−{fmt(tx.amount)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <button className="btn-dim" onClick={() => { setNewTx(p => ({...p, envelopeId:String(env.id)})); setShowAddTx(true); }}>Add Expense</button>
+          {unmapped.length > 0 && (
+            <button className="card" style={{padding:"13px 16px",marginBottom:20,width:"100%",display:"flex",alignItems:"center",gap:12,border:"1px solid #ffd60a40",cursor:"pointer"}}
+              onClick={()=>setMapTx(unmapped[0])}>
+              <span style={{fontSize:22}}>📥</span>
+              <div style={{flex:1,textAlign:"left"}}>
+                <div style={{fontSize:15,fontWeight:600}}>Transactions to sort</div>
+                <div style={{fontSize:12,color:"#636366",marginTop:1}}>Teach Budgetgum where these go</div>
               </div>
-            );
-          })}
-        </div>
-      )}
+              <span className="badge">{unmapped.length}</span>
+            </button>
+          )}
 
-      {/* BILLS */}
-      {tab === "bills" && (
-        <div style={{padding:"20px 22px 110px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-            <div className="sec-label">Bill Reminders</div>
-            <button className="link" style={{fontSize:15}} onClick={() => setShowAddBill(true)}>+ New</button>
-          </div>
-          <div className="card" style={{padding:"16px 18px",marginBottom:20,display:"flex"}}>
-            {[["Total",fmt(bills.reduce((s,b)=>s+b.amount,0)),"#fff"],["Paid",fmt(bills.filter(b=>b.paid).reduce((s,b)=>s+b.amount,0)),"#30d158"],["Due",fmt(bills.filter(b=>!b.paid).reduce((s,b)=>s+b.amount,0)),"#ffd60a"]].map(([label,val,color],i) => (
-              <div key={i} style={{flex:1,textAlign:i===0?"left":i===1?"center":"right"}}>
-                <div style={{fontSize:12,color:"#636366",fontWeight:500,marginBottom:4}}>{label}</div>
-                <div style={{fontSize:20,fontWeight:700,letterSpacing:"-1px",color}}>{val}</div>
-              </div>
-            ))}
-          </div>
-          <div className="sec-label" style={{marginBottom:10}}>Unpaid · {unpaidBills.length}</div>
-          <div className="grp" style={{marginBottom:24}}>
-            {unpaidBills.map(bill => {
-              const days = getDays(bill.dueDay), env = envelopes.find(e => e.id === bill.envelopeId);
-              return (
-                <button key={bill.id} className="row-tap row" onClick={() => setPayModal(bill)}>
-                  <div style={{width:36,height:36,borderRadius:11,background:urgency(days)+"22",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>{env?.icon||"📄"}</div>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px"}}>{bill.name}</div>
-                    <div style={{fontSize:13,color:"#636366",marginTop:1}}>Due {ordinal(bill.dueDay)} · {bill.category}</div>
-                  </div>
-                  <div style={{textAlign:"right",marginRight:6}}>
-                    <div style={{fontSize:16,fontWeight:600,letterSpacing:"-.4px"}}>{fmt(bill.amount)}</div>
-                    <div style={{fontSize:12,color:urgency(days),fontWeight:500,marginTop:1}}>{days===0?"Today":`${days}d`}</div>
-                  </div>
-                  <div style={{color:"#48484a",fontSize:18}}>›</div>
-                </button>
-              );
-            })}
-          </div>
-          <div className="sec-label" style={{marginBottom:10}}>Paid · {bills.filter(b=>b.paid).length}</div>
-          <div className="grp">
-            {bills.filter(b => b.paid).map(bill => (
-              <div key={bill.id} className="row" style={{opacity:.45}}>
-                <div style={{width:36,height:36,borderRadius:11,background:"#30d15822",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>✓</div>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px",textDecoration:"line-through",color:"#636366"}}>{bill.name}</div>
-                  <div style={{fontSize:13,color:"#48484a",marginTop:1}}>{bill.category}</div>
-                </div>
-                <div style={{fontSize:15,color:"#48484a",fontWeight:600}}>{fmt(bill.amount)}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ACTIVITY */}
-      {tab === "activity" && (
-        <div style={{padding:"20px 22px 110px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-            <div className="sec-label">Transactions</div>
-            <button className="link" style={{fontSize:15}} onClick={() => setShowAddTx(true)}>+ Log</button>
-          </div>
-          {bankConnected && (
+          {envelopes.length === 0 ? (
+            <EmptyState onAdd={()=>setEditEnv({})} />
+          ) : (
             <>
-              <button className="btn-dim" style={{marginBottom:8,fontSize:15,fontWeight:600,letterSpacing:"-.3px",color:syncing?"#636366":"#0a84ff"}} onClick={syncBank} disabled={syncing}>
-                {syncing ? "Syncing…" : "↻  Sync Bank"}
-              </button>
-              <button onClick={disconnectBank} style={{background:"none",border:"none",color:"#48484a",fontSize:12,cursor:"pointer",fontFamily:"inherit",width:"100%",padding:"4px 0 14px",textAlign:"center"}}>
-                Disconnect bank
-              </button>
+              <div className="sec">Envelopes</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11,marginBottom:22}}>
+                {envelopes.map(env => (
+                  <EnvCard key={env.id} env={env} transactions={transactions} onClick={()=>setDetailEnv(env)} />
+                ))}
+              </div>
+              <button className="btn-dim" onClick={()=>setEditEnv({})}>+ New Envelope</button>
             </>
           )}
-          <div className="grp">
-            {transactions.length === 0 && <div style={{padding:"24px 16px",textAlign:"center",color:"#636366",fontSize:15}}>No transactions yet.</div>}
-            {transactions.map(tx => {
-              const env = envelopes.find(e => e.id === tx.envelopeId);
-              return (
-                <div key={tx.id} className="row">
-                  <div style={{width:36,height:36,borderRadius:10,background:env?env.color+"22":"#2c2c2e",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0}}>{env?.icon||"💸"}</div>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px"}}>{tx.desc}</div>
-                    <div style={{fontSize:13,color:"#636366",marginTop:1}}>{env?.name||"—"} · {tx.date}</div>
-                  </div>
-                  <div style={{textAlign:"right"}}>
-                    <div style={{fontSize:16,fontWeight:600,letterSpacing:"-.4px",color:"#aeaeb2"}}>−{fmt(tx.amount)}</div>
-                    <div style={{fontSize:11,color:"#48484a",marginTop:1,textTransform:"capitalize"}}>{tx.type}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
         </div>
       )}
 
-      {/* TAB BAR */}
-      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:"rgba(0,0,0,.82)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",borderTop:".5px solid rgba(255,255,255,.1)",display:"flex",padding:"10px 0 28px"}}>
-        {[["dashboard","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,label]) => (
-          <button key={t} onClick={() => setTab(t)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3,color:tab===t?"#c5f135":"#636366",transition:"color .15s",fontSize:10,fontWeight:500,letterSpacing:".4px",textTransform:"uppercase"}}>
-            <span style={{fontSize:22}}>{ic}</span>{label}
+      {/* ═══ ENVELOPES ═══ */}
+      {tab === "envelopes" && (
+        <div style={S.page}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div className="sec" style={{margin:0}}>All Envelopes</div>
+            <button className="link" onClick={()=>setEditEnv({})}>+ New</button>
+          </div>
+          {envelopes.length === 0 ? <EmptyState onAdd={()=>setEditEnv({})} /> : (
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {envelopes.map(env => (
+                <EnvRow key={env.id} env={env} transactions={transactions}
+                  onOpen={()=>setDetailEnv(env)} onFund={()=>setFundEnv(env)} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ BILLS ═══ */}
+      {tab === "bills" && (
+        <div style={S.page}>
+          <div className="sec">Bills & Debts</div>
+          {bills.length === 0 ? (
+            <div className="card" style={{padding:28,textAlign:"center"}}>
+              <div style={{fontSize:36,marginBottom:10}}>◎</div>
+              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No bills yet</div>
+              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                Recurring and Debt envelopes show up here automatically.
+              </div>
+              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.RECURRING})}>Add a Bill</button>
+            </div>
+          ) : (
+            <div style={{display:"flex",flexDirection:"column",gap:9}}>
+              {bills
+                .slice()
+                .sort((a,b) => (nextDueDate(a)||0) - (nextDueDate(b)||0))
+                .map(env => <BillRow key={env.id} env={env} transactions={transactions}
+                    onOpen={()=>setDetailEnv(env)} onMarkPaid={()=>markPaid(env)} />)}
+            </div>
+          )}
+
+          {debts.length > 0 && (
+            <>
+              <div className="sec" style={{marginTop:26}}>Debt Payoff</div>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {debts.map(env => <DebtCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ═══ ACTIVITY ═══ */}
+      {tab === "activity" && (
+        <div style={S.page}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <div className="sec" style={{margin:0}}>Transactions</div>
+            {bankConnected && <button className="link" onClick={syncBank} disabled={syncing} style={{color:syncing?"#48484a":"#0a84ff",fontSize:15}}>{syncing?"Syncing…":"↻ Sync"}</button>}
+          </div>
+          {transactions.length === 0 ? (
+            <div className="card" style={{padding:28,textAlign:"center",color:"#636366",fontSize:14}}>
+              No transactions yet. Connect your bank and sync.
+            </div>
+          ) : (
+            <div className="grp">
+              {transactions.slice(0,60).map(tx => {
+                const env = envelopes.find(e => e.id === tx.envelopeId);
+                return (
+                  <div key={tx.id} className="row">
+                    <div className="ibox" style={{background:env?env.color+"22":"#2c2c2e"}}>{env?.icon||"💸"}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:15,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tx.desc}</div>
+                      <div style={{fontSize:12,color:"#636366",marginTop:1}}>{env?.name||"Unassigned"} · {tx.date}</div>
+                    </div>
+                    <div style={{fontSize:15,fontWeight:600,color:"#aeaeb2"}}>−{money(tx.amount)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ TAB BAR ═══ */}
+      <div className="tabbar">
+        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+          <button key={t} onClick={()=>setTab(t)} className={`tb ${tab===t?"on":""}`}>
+            <span style={{fontSize:21}}>{ic}</span>{l}
           </button>
         ))}
       </div>
 
-      {/* ASSIGN MODAL */}
-      {mapModal && (
-        <div className="overlay" onClick={() => setMapModal(null)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <div style={{width:36,height:5,background:"#48484a",borderRadius:3,margin:"12px auto 0"}}/>
-            <div style={{padding:"20px 20px 8px"}}>
-              <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px",marginBottom:4}}>Where does this go?</div>
-              <div style={{fontSize:15,color:"#636366"}}>{mapModal.desc} · {fmt(mapModal.amount)}</div>
-              <div style={{fontSize:13,color:"#48484a",marginTop:2}}>{mapModal.date}</div>
-            </div>
-            <div style={{padding:"8px 20px 40px",display:"flex",flexDirection:"column",gap:8}}>
-              {envelopes.map(env => (
-                <button key={env.id} className="row-tap" style={{background:"#2c2c2e",borderRadius:14,padding:"13px 16px",display:"flex",alignItems:"center",gap:12}} onClick={() => assignUnmapped(mapModal, env.id)}>
-                  <span style={{fontSize:22}}>{env.icon}</span>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:16,fontWeight:500,letterSpacing:"-.3px"}}>{env.name}</div>
-                    <div style={{fontSize:13,color:"#636366"}}>{fmt(env.budget-env.spent)} left</div>
-                  </div>
-                  <span style={{color:"#48484a",fontSize:18}}>›</span>
-                </button>
-              ))}
-              <button className="link" style={{textAlign:"center",color:"#636366",fontSize:15,marginTop:4}} onClick={() => { setUnmapped(p => p.filter(t => t.id !== mapModal.id)); setMapModal(null); }}>Skip this transaction</button>
-            </div>
-          </div>
+      {/* ═══ SHEETS ═══ */}
+      {editEnv   && <EnvelopeForm initial={editEnv} onSave={saveEnvelope} onCancel={()=>setEditEnv(null)} />}
+      {detailEnv && <EnvelopeDetail env={envelopes.find(e=>e.id===detailEnv.id) || detailEnv}
+                      transactions={transactions}
+                      onClose={()=>setDetailEnv(null)}
+                      onEdit={()=>{ setEditEnv(detailEnv); setDetailEnv(null); }}
+                      onDelete={()=>deleteEnvelope(detailEnv.id)}
+                      onFund={()=>{ setFundEnv(detailEnv); setDetailEnv(null); }}
+                      onMarkPaid={()=>markPaid(detailEnv)} />}
+      {fundEnv   && <FundSheet env={envelopes.find(e=>e.id===fundEnv.id)} sts={sts} transactions={transactions}
+                      onFund={a=>{fund(fundEnv.id,a); setFundEnv(null);}}
+                      onUnfund={a=>{unfund(fundEnv.id,a); setFundEnv(null);}}
+                      onClose={()=>setFundEnv(null)} />}
+      {mapTx     && <AssignSheet tx={mapTx} envelopes={envelopes}
+                      onAssign={assignTx}
+                      onSkip={()=>{ setUnmapped(p=>p.filter(t=>t.id!==mapTx.id)); setMapTx(null); }}
+                      onClose={()=>setMapTx(null)} />}
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMPONENTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+function EmptyState({ onAdd }) {
+  return (
+    <div className="card" style={{padding:"36px 24px",textAlign:"center"}}>
+      <div style={{fontSize:44,marginBottom:14}}>✉️</div>
+      <div style={{fontSize:18,fontWeight:700,letterSpacing:"-.4px",marginBottom:6}}>No envelopes yet</div>
+      <div style={{fontSize:14,color:"#636366",lineHeight:1.55,marginBottom:20}}>
+        Start with one. A credit card you're paying down, a bill that repeats, or just a grocery budget.
+      </div>
+      <button className="btn-green" onClick={onAdd}>Create Your First Envelope</button>
+    </div>
+  );
+}
+
+function EnvCard({ env, transactions, onClick }) {
+  const locked = isLocked(env, transactions);
+  const paid = isPaid(env, transactions);
+
+  let big, small, pct, barColor;
+  if (env.type === TYPES.SPENDING) {
+    const spent = spentThisMonth(env, transactions);
+    const left = (env.monthlyBudget||0) - spent;
+    big = money(left); small = `of ${money(env.monthlyBudget)}`;
+    pct = Math.min(100, (spent/(env.monthlyBudget||1))*100);
+    barColor = pct>90?"#ff375f":pct>70?"#ffd60a":env.color;
+  } else if (env.type === TYPES.DEBT) {
+    big = money(env.currentBalance||0); small = "still owed";
+    pct = progress(env); barColor = "#30d158";
+  } else if (env.type === TYPES.GOAL) {
+    big = money(env.currentBalance||0); small = `of ${money(env.targetAmount)}`;
+    pct = progress(env); barColor = env.color;
+  } else {
+    big = money(env.billAmount||0); small = paid ? "paid" : "due";
+    pct = paid?100:Math.min(100,((env.funded||0)/(env.billAmount||1))*100);
+    barColor = paid?"#30d158":env.color;
+  }
+
+  return (
+    <button className="card env-card" onClick={onClick}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+        <span style={{fontSize:26}}>{env.icon}</span>
+        <div style={{display:"flex",gap:3}}>
+          {locked && <span title="Locked" style={{fontSize:13}}>🔒</span>}
+          {paid && <span style={{fontSize:13,color:"#30d158"}}>✓</span>}
+        </div>
+      </div>
+      <div style={{fontSize:12,color:"#636366",fontWeight:500,marginBottom:2}}>{env.name}</div>
+      <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.9px",lineHeight:1.1}}>{big}</div>
+      <div style={{fontSize:11,color:"#48484a",marginBottom:9}}>{small}</div>
+      <div className="bar"><div className="fill" style={{width:`${pct}%`,background:barColor}}/></div>
+      {(env.funded||0) > 0 && (
+        <div style={{fontSize:10,color:locked?"#ffd60a":"#8e8e93",marginTop:6,letterSpacing:".2px"}}>
+          {locked ? "🔒 " : ""}{money(env.funded)} set aside
         </div>
       )}
+    </button>
+  );
+}
 
-      {/* PAY MODAL */}
-      {payModal && (
-        <div className="overlay" onClick={() => setPayModal(null)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <div style={{width:36,height:5,background:"#48484a",borderRadius:3,margin:"12px auto 0"}}/>
-            <div style={{textAlign:"center",padding:"28px 24px 20px"}}>
-              <div style={{fontSize:56,marginBottom:14}}>{envelopes.find(e=>e.id===payModal.envelopeId)?.icon||"📄"}</div>
-              <div style={{fontSize:15,color:"#636366",fontWeight:500}}>{payModal.category}</div>
-              <div style={{fontSize:28,fontWeight:700,letterSpacing:"-1px",marginTop:4}}>{payModal.name}</div>
-              <div style={{fontSize:48,fontWeight:700,letterSpacing:"-2.5px",color:"#c5f135",marginTop:8,lineHeight:1}}>{fmt(payModal.amount)}</div>
-              <div style={{fontSize:14,color:"#636366",marginTop:8}}>Due {ordinal(payModal.dueDay)} · {getDays(payModal.dueDay)} days away</div>
-            </div>
-            <div style={{margin:"0 20px 16px"}}>
-              <div className="grp">
-                {[["From Envelope",envelopes.find(e=>e.id===payModal.envelopeId)?.name||"Unassigned"],["Frequency","Monthly"],["Category",payModal.category]].map(([k,v]) => (
-                  <div key={k} className="row" style={{justifyContent:"space-between"}}>
-                    <span style={{fontSize:16,color:"#636366"}}>{k}</span>
-                    <span style={{fontSize:16,fontWeight:500}}>{v}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div style={{padding:"0 20px 12px"}}><button className="btn-green" onClick={() => payBill(payModal)}>Confirm Payment</button></div>
-            <div style={{padding:"0 20px 20px"}}><button className="link" style={{width:"100%",textAlign:"center",color:"#636366",fontSize:16}} onClick={() => setPayModal(null)}>Cancel</button></div>
+function EnvRow({ env, transactions, onOpen, onFund }) {
+  const locked = isLocked(env, transactions);
+  const paid = isPaid(env, transactions);
+  const short = shortfall(env, transactions);
+  const due = nextDueDate(env);
+
+  return (
+    <div className="card" style={{padding:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,cursor:"pointer"}} onClick={onOpen}>
+        <div className="ibox-lg" style={{background:env.color+"22",border:`1px solid ${env.color}33`}}>{env.icon}</div>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:16,fontWeight:600,letterSpacing:"-.3px"}}>{env.name}</span>
+            {locked && <span style={{fontSize:12}}>🔒</span>}
+            {paid && <span style={{fontSize:12,color:"#30d158"}}>✓</span>}
+          </div>
+          <div style={{fontSize:12,color:"#636366",marginTop:2}}>
+            {TYPE_META[env.type].label}
+            {isBill(env.type) && due && ` · due ${due.toLocaleDateString("en-US",{month:"short",day:"numeric"})}`}
+            {env.autopay && " · autopay"}
           </div>
         </div>
-      )}
+        <span style={{color:"#48484a",fontSize:18}}>›</span>
+      </div>
 
-      {/* ADD ENVELOPE */}
-      {showAddEnv && (
-        <div className="overlay" onClick={() => setShowAddEnv(false)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <div style={{width:36,height:5,background:"#48484a",borderRadius:3,margin:"12px auto 0"}}/>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"18px 20px 8px"}}>
-              <span style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>New Envelope</span>
-              <button className="link" onClick={() => setShowAddEnv(false)}>Cancel</button>
-            </div>
-            <div style={{padding:"12px 20px 40px",display:"flex",flexDirection:"column",gap:10}}>
-              <input placeholder="Name" value={newEnv.name} onChange={e => setNewEnv(p => ({...p, name:e.target.value}))} className="input"/>
-              <input placeholder="Monthly budget" type="number" value={newEnv.budget} onChange={e => setNewEnv(p => ({...p, budget:e.target.value}))} className="input"/>
-              <div style={{fontSize:13,color:"#636366",fontWeight:500,marginTop:4}}>Icon</div>
-              <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-                {ICONS.map(ic => <button key={ic} onClick={() => setNewEnv(p => ({...p, icon:ic}))} style={{width:46,height:46,borderRadius:13,background:newEnv.icon===ic?"#c5f135":"#2c2c2e",fontSize:22,border:"none",cursor:"pointer"}}>{ic}</button>)}
-              </div>
-              <div style={{fontSize:13,color:"#636366",fontWeight:500}}>Color</div>
-              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-                {COLORS.map(c => <button key={c} onClick={() => setNewEnv(p => ({...p, color:c}))} style={{width:30,height:30,borderRadius:"50%",background:c,border:newEnv.color===c?"3px solid #fff":"3px solid transparent",cursor:"pointer"}}/>)}
-              </div>
-              <button className="btn-green" style={{marginTop:6}} onClick={addEnvelope}>Create Envelope</button>
-            </div>
+      {isBill(env.type) && !paid && (
+        <div style={{marginTop:12,paddingTop:12,borderTop:".5px solid rgba(255,255,255,.07)"}}>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:6}}>
+            <span style={{color:"#8e8e93"}}>Funded {money(env.funded||0)} / {money(targetAmount(env))}</span>
+            {short>0 && <span style={{color:"#ffd60a",fontWeight:600}}>{money(short)} short</span>}
           </div>
-        </div>
-      )}
-
-      {/* ADD BILL */}
-      {showAddBill && (
-        <div className="overlay" onClick={() => setShowAddBill(false)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <div style={{width:36,height:5,background:"#48484a",borderRadius:3,margin:"12px auto 0"}}/>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"18px 20px 8px"}}>
-              <span style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>New Bill</span>
-              <button className="link" onClick={() => setShowAddBill(false)}>Cancel</button>
-            </div>
-            <div style={{padding:"12px 20px 40px",display:"flex",flexDirection:"column",gap:10}}>
-              <input placeholder="Bill name" value={newBill.name} onChange={e => setNewBill(p => ({...p, name:e.target.value}))} className="input"/>
-              <input placeholder="Amount" type="number" value={newBill.amount} onChange={e => setNewBill(p => ({...p, amount:e.target.value}))} className="input"/>
-              <input placeholder="Due day (1–31)" type="number" min="1" max="31" value={newBill.dueDay} onChange={e => setNewBill(p => ({...p, dueDay:e.target.value}))} className="input"/>
-              <select value={newBill.envelopeId} onChange={e => setNewBill(p => ({...p, envelopeId:e.target.value}))} className="input">
-                <option value="">Link to envelope (optional)</option>
-                {envelopes.map(e => <option key={e.id} value={e.id}>{e.icon} {e.name}</option>)}
-              </select>
-              <select value={newBill.category} onChange={e => setNewBill(p => ({...p, category:e.target.value}))} className="input">
-                {["Housing","Utilities","Transport","Subscriptions","Insurance","Health","Other"].map(c => <option key={c}>{c}</option>)}
-              </select>
-              <button className="btn-green" onClick={addBill}>Add Bill Reminder</button>
-            </div>
+          <div className="bar" style={{marginBottom:10}}>
+            <div className="fill" style={{width:`${Math.min(100,((env.funded||0)/(targetAmount(env)||1))*100)}%`,background:short>0?"#ffd60a":"#30d158"}}/>
           </div>
-        </div>
-      )}
-
-      {/* ADD TRANSACTION */}
-      {showAddTx && (
-        <div className="overlay" onClick={() => setShowAddTx(false)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <div style={{width:36,height:5,background:"#48484a",borderRadius:3,margin:"12px auto 0"}}/>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"18px 20px 8px"}}>
-              <span style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>Log Expense</span>
-              <button className="link" onClick={() => setShowAddTx(false)}>Cancel</button>
-            </div>
-            <div style={{padding:"12px 20px 40px",display:"flex",flexDirection:"column",gap:10}}>
-              <input placeholder="Description" value={newTx.desc} onChange={e => setNewTx(p => ({...p, desc:e.target.value}))} className="input"/>
-              <input placeholder="Amount" type="number" value={newTx.amount} onChange={e => setNewTx(p => ({...p, amount:e.target.value}))} className="input"/>
-              <select value={newTx.envelopeId} onChange={e => setNewTx(p => ({...p, envelopeId:e.target.value}))} className="input">
-                <option value="">Select envelope</option>
-                {envelopes.map(e => <option key={e.id} value={e.id}>{e.icon} {e.name}</option>)}
-              </select>
-              <input type="date" value={newTx.date} onChange={e => setNewTx(p => ({...p, date:e.target.value}))} className="input"/>
-              <button className="btn-green" onClick={addManualTx}>Record Expense</button>
-            </div>
-          </div>
+          <button className="btn-dim" style={{padding:10,fontSize:14}} onClick={onFund} disabled={locked}>
+            {locked ? "🔒 Locked" : "Fund"}
+          </button>
         </div>
       )}
     </div>
   );
 }
+
+function BillRow({ env, transactions, onOpen, onMarkPaid }) {
+  const paid = isPaid(env, transactions);
+  const locked = isLocked(env, transactions);
+  const due = nextDueDate(env);
+  const days = due ? daysBetween(new Date(), due) : null;
+  const amt = targetAmount(env);
+  const actual = paidThisPeriod(env, transactions);
+  const urg = days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
+
+  return (
+    <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1}}>
+      <div style={{display:"flex",alignItems:"center",gap:11}}>
+        <div className="ibox" style={{background:paid?"#30d15822":urg+"22"}}>{paid?"✓":env.icon}</div>
+        <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={onOpen}>
+          <div style={{display:"flex",alignItems:"center",gap:5}}>
+            <span style={{fontSize:15,fontWeight:600,textDecoration:paid?"line-through":"none",color:paid?"#636366":"#fff"}}>{env.name}</span>
+            {locked && <span style={{fontSize:11}}>🔒</span>}
+          </div>
+          <div style={{fontSize:12,color:paid?"#48484a":urg,marginTop:2,fontWeight:500}}>
+            {paid ? `Paid ${money(actual)}` : days===0 ? "Due today" : days===1 ? "Due tomorrow" : `Due in ${days} days`}
+            {!paid && env.autopay && ` · autopay`}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:15,fontWeight:600}}>{money(amt)}</div>
+          {!paid && (env.funded||0)>0 && <div style={{fontSize:11,color:"#8e8e93",marginTop:1}}>{money(env.funded)} ready</div>}
+        </div>
+      </div>
+      {!paid && (
+        <div style={{display:"flex",gap:8,marginTop:11}}>
+          {env.paymentUrl && (
+            <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-mini" style={{background:"#c5f135",color:"#000",textDecoration:"none"}}>
+              Pay now ↗
+            </a>
+          )}
+          <button className="btn-mini" onClick={onMarkPaid}>Mark paid</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebtCard({ env, onClick }) {
+  const pct = progress(env);
+  const variance = scheduleVariance(env);
+  const risk = promoRisk(env);
+  const sugg = suggestedPayment(env);
+  const orig = env.originalBalance || 0;
+
+  return (
+    <button className="card" onClick={onClick} style={{padding:17,textAlign:"left",width:"100%",border:risk&&risk.status!=="ok"?"1px solid #ffd60a44":"none"}}>
+      <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:13}}>
+        <div className="ibox-lg" style={{background:env.color+"22"}}>{env.icon}</div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:16,fontWeight:600}}>{env.name}</div>
+          <div style={{fontSize:12,color:"#636366",marginTop:1}}>
+            Payoff by {new Date(env.targetDate+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.8px"}}>{money(env.currentBalance||0)}</div>
+          <div style={{fontSize:11,color:"#48484a"}}>of {money(orig)}</div>
+        </div>
+      </div>
+
+      <div className="bar" style={{height:7,marginBottom:8}}>
+        <div className="fill" style={{width:`${pct}%`,background:"linear-gradient(90deg,#30d158,#c5f135)"}}/>
+      </div>
+
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:12}}>
+        <span style={{color:"#30d158",fontWeight:600}}>{Math.round(pct)}% paid off</span>
+        {variance !== null && (
+          <span style={{color:variance>=0?"#30d158":"#ff9f0a",fontWeight:600}}>
+            {variance>=0 ? `${money(variance)} ahead` : `${money(Math.abs(variance))} behind`}
+          </span>
+        )}
+      </div>
+
+      <div style={{background:"#2c2c2e",borderRadius:10,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:11,color:"#8e8e93"}}>Suggested {env.frequency||"monthly"}</div>
+          <div style={{fontSize:17,fontWeight:700,letterSpacing:"-.5px",color:"#c5f135"}}>{money(sugg)}</div>
+        </div>
+        <div style={{fontSize:11,color:"#48484a",textAlign:"right",maxWidth:130,lineHeight:1.4}}>
+          to finish on time
+        </div>
+      </div>
+
+      {risk && risk.status !== "ok" && (
+        <div style={{marginTop:10,background:"#2a1f08",border:"1px solid #ffd60a33",borderRadius:10,padding:"9px 11px",display:"flex",gap:8,alignItems:"flex-start"}}>
+          <span style={{fontSize:14}}>⚠️</span>
+          <div style={{fontSize:12,color:"#ffd60a",lineHeight:1.45}}>{risk.message}</div>
+        </div>
+      )}
+      {risk && risk.status === "ok" && (
+        <div style={{marginTop:8,fontSize:11,color:"#30d158",textAlign:"center"}}>
+          0% APR — {risk.daysLeft} days left
+        </div>
+      )}
+    </button>
+  );
+}
+
+// ─── Envelope create/edit form ───────────────────────────────────────────────
+function EnvelopeForm({ initial, onSave, onCancel }) {
+  const [f, setF] = useState({
+    type: initial.type || TYPES.SPENDING,
+    name: initial.name || "",
+    icon: initial.icon || "💳",
+    color: initial.color || "#0a84ff",
+    monthlyBudget: initial.monthlyBudget || "",
+    billAmount: initial.billAmount || "",
+    currentBalance: initial.currentBalance || "",
+    targetAmount: initial.targetAmount || "",
+    targetDate: initial.targetDate || "",
+    frequency: initial.frequency || "monthly",
+    dueDay: initial.dueDay ?? 1,
+    annualDate: initial.annualDate || "01-01",
+    minimumPayment: initial.minimumPayment || "",
+    promoEndDate: initial.promoEndDate || "",
+    postPromoAPR: initial.postPromoAPR || "",
+    paymentUrl: initial.paymentUrl || "",
+    autopay: initial.autopay || false,
+    autopayLeadDays: initial.autopayLeadDays ?? 5,
+    id: initial.id,
+    matchPatterns: initial.matchPatterns || [],
+  });
+  const set = (k,v) => setF(p => ({...p,[k]:v}));
+
+  const bill = isBill(f.type);
+  const target = hasTarget(f.type);
+
+  // Live preview of the suggested payment as they type — the "aha" moment.
+  const preview = useMemo(() => {
+    if (!target || !f.targetDate) return null;
+    const fake = {
+      ...f,
+      type: f.type,
+      currentBalance: parseFloat(f.currentBalance) || 0,
+      targetAmount: parseFloat(f.targetAmount) || 0,
+      dueDay: parseInt(f.dueDay) || 1,
+    };
+    const s = suggestedPayment(fake);
+    return s > 0 ? s : null;
+  }, [f, target]);
+
+  function save() {
+    if (!f.name.trim()) return;
+    const out = {
+      ...f,
+      name: f.name.trim(),
+      monthlyBudget: parseFloat(f.monthlyBudget) || 0,
+      billAmount: parseFloat(f.billAmount) || 0,
+      currentBalance: parseFloat(f.currentBalance) || 0,
+      targetAmount: parseFloat(f.targetAmount) || 0,
+      minimumPayment: parseFloat(f.minimumPayment) || 0,
+      postPromoAPR: parseFloat(f.postPromoAPR) || 0,
+      dueDay: parseInt(f.dueDay) || 1,
+      autopayLeadDays: parseInt(f.autopayLeadDays) || 5,
+    };
+    onSave(out);
+  }
+
+  return (
+    <Sheet onClose={onCancel} title={initial.id ? "Edit Envelope" : "New Envelope"}>
+      {/* Type picker */}
+      {!initial.id && (
+        <>
+          <Label>Type</Label>
+          <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:6}}>
+            {Object.values(TYPES).map(t => (
+              <button key={t} onClick={()=>set("type",t)}
+                style={{background:f.type===t?"#c5f13518":"#2c2c2e",border:f.type===t?"1px solid #c5f135":"1px solid transparent",
+                        borderRadius:12,padding:"11px 13px",textAlign:"left",cursor:"pointer",fontFamily:"inherit"}}>
+                <div style={{fontSize:14,fontWeight:600,color:f.type===t?"#c5f135":"#fff"}}>{TYPE_META[t].label}</div>
+                <div style={{fontSize:11.5,color:"#8e8e93",marginTop:2,lineHeight:1.4}}>{TYPE_META[t].blurb}</div>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <Label>Name</Label>
+      <input className="in" value={f.name} onChange={e=>set("name",e.target.value)} placeholder={f.type===TYPES.DEBT?"Amex Blue Cash":"Groceries"} />
+
+      {/* Type-specific fields */}
+      {f.type === TYPES.SPENDING && (
+        <>
+          <Label>Monthly budget</Label>
+          <input className="in" type="number" value={f.monthlyBudget} onChange={e=>set("monthlyBudget",e.target.value)} placeholder="600" />
+        </>
+      )}
+
+      {f.type === TYPES.RECURRING && (
+        <>
+          <Label>Amount</Label>
+          <input className="in" type="number" value={f.billAmount} onChange={e=>set("billAmount",e.target.value)} placeholder="15.99" />
+        </>
+      )}
+
+      {f.type === TYPES.DEBT && (
+        <>
+          <Label>Current balance owed</Label>
+          <input className="in" type="number" value={f.currentBalance} onChange={e=>set("currentBalance",e.target.value)} placeholder="6000" />
+          <Label>Pay off by</Label>
+          <input className="in" type="date" value={f.targetDate} onChange={e=>set("targetDate",e.target.value)} />
+          <Label>Minimum payment <Dim>(optional)</Dim></Label>
+          <input className="in" type="number" value={f.minimumPayment} onChange={e=>set("minimumPayment",e.target.value)} placeholder="35" />
+          <Label>0% APR ends <Dim>(optional — but this is the one that matters)</Dim></Label>
+          <input className="in" type="date" value={f.promoEndDate} onChange={e=>set("promoEndDate",e.target.value)} />
+          {f.promoEndDate && (
+            <>
+              <Label>Rate after 0% <Dim>(optional)</Dim></Label>
+              <input className="in" type="number" value={f.postPromoAPR} onChange={e=>set("postPromoAPR",e.target.value)} placeholder="24.99" />
+            </>
+          )}
+        </>
+      )}
+
+      {f.type === TYPES.GOAL && (
+        <>
+          <Label>Target amount</Label>
+          <input className="in" type="number" value={f.targetAmount} onChange={e=>set("targetAmount",e.target.value)} placeholder="2000" />
+          <Label>Already saved</Label>
+          <input className="in" type="number" value={f.currentBalance} onChange={e=>set("currentBalance",e.target.value)} placeholder="0" />
+          <Label>By when</Label>
+          <input className="in" type="date" value={f.targetDate} onChange={e=>set("targetDate",e.target.value)} />
+        </>
+      )}
+
+      {/* Schedule — bills and targets both need one */}
+      {(bill || target) && (
+        <>
+          <Label>How often</Label>
+          <div style={{display:"flex",gap:7,marginBottom:6}}>
+            {["monthly","weekly","annual"].map(fr => (
+              <button key={fr} onClick={()=>set("frequency",fr)}
+                style={{flex:1,background:f.frequency===fr?"#c5f135":"#2c2c2e",color:f.frequency===fr?"#000":"#fff",
+                        border:"none",borderRadius:10,padding:"10px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textTransform:"capitalize"}}>
+                {fr}
+              </button>
+            ))}
+          </div>
+
+          {f.frequency === "monthly" && (
+            <>
+              <Label>Day of month</Label>
+              <input className="in" type="number" min="1" max="31" value={f.dueDay} onChange={e=>set("dueDay",e.target.value)} />
+            </>
+          )}
+          {f.frequency === "weekly" && (
+            <>
+              <Label>Day of week</Label>
+              <div style={{display:"flex",gap:5,marginBottom:6}}>
+                {DOW.map((d,i)=>(
+                  <button key={d} onClick={()=>set("dueDay",i)}
+                    style={{flex:1,background:Number(f.dueDay)===i?"#c5f135":"#2c2c2e",color:Number(f.dueDay)===i?"#000":"#8e8e93",
+                            border:"none",borderRadius:8,padding:"9px 0",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                    {d[0]}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          {f.frequency === "annual" && (
+            <>
+              <Label>Date (MM-DD)</Label>
+              <input className="in" value={f.annualDate} onChange={e=>set("annualDate",e.target.value)} placeholder="04-15" />
+            </>
+          )}
+        </>
+      )}
+
+      {/* THE SUGGESTION — live, as they type */}
+      {preview && (
+        <div style={{background:"#1a2408",border:"1px solid #c5f13544",borderRadius:12,padding:"13px 15px",margin:"14px 0 6px"}}>
+          <div style={{fontSize:11,color:"#8e9e6a",letterSpacing:".4px",textTransform:"uppercase",marginBottom:3}}>Suggested {f.frequency} payment</div>
+          <div style={{fontSize:26,fontWeight:700,color:"#c5f135",letterSpacing:"-1px"}}>{money(preview)}</div>
+          <div style={{fontSize:11.5,color:"#8e8e93",marginTop:4,lineHeight:1.45}}>
+            A hint, not a rule. Pay what you can — Budgetgum recalculates from what actually clears.
+          </div>
+        </div>
+      )}
+
+      {/* Bill extras */}
+      {bill && (
+        <>
+          <Label>Payment link <Dim>(optional)</Dim></Label>
+          <input className="in" value={f.paymentUrl} onChange={e=>set("paymentUrl",e.target.value)} placeholder="https://..." />
+
+          <div style={{background:"#2c2c2e",borderRadius:12,padding:"13px 15px",marginTop:12}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <div style={{flex:1,paddingRight:12}}>
+                <div style={{fontSize:14,fontWeight:600}}>Autopay</div>
+                <div style={{fontSize:11.5,color:"#8e8e93",marginTop:2,lineHeight:1.45}}>
+                  Funds lock a few business days early — once the ACH is moving, you can't take it back.
+                </div>
+              </div>
+              <button onClick={()=>set("autopay",!f.autopay)}
+                style={{width:50,height:30,borderRadius:15,background:f.autopay?"#30d158":"#48484a",border:"none",position:"relative",cursor:"pointer",flexShrink:0}}>
+                <div style={{position:"absolute",top:3,left:f.autopay?23:3,width:24,height:24,borderRadius:12,background:"#fff",transition:"left .18s"}}/>
+              </button>
+            </div>
+            {f.autopay && (
+              <div style={{marginTop:12,paddingTop:12,borderTop:".5px solid rgba(255,255,255,.09)"}}>
+                <div style={{fontSize:12,color:"#8e8e93",marginBottom:7}}>Locks this many business days before due:</div>
+                <div style={{display:"flex",gap:6}}>
+                  {[2,3,4,5,7].map(n=>(
+                    <button key={n} onClick={()=>set("autopayLeadDays",n)}
+                      style={{flex:1,background:Number(f.autopayLeadDays)===n?"#c5f135":"#3a3a3c",color:Number(f.autopayLeadDays)===n?"#000":"#fff",
+                              border:"none",borderRadius:8,padding:"9px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      <Label style={{marginTop:16}}>Icon</Label>
+      <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:6}}>
+        {ICONS.map(ic=>(
+          <button key={ic} onClick={()=>set("icon",ic)}
+            style={{width:42,height:42,borderRadius:11,background:f.icon===ic?"#c5f135":"#2c2c2e",fontSize:20,border:"none",cursor:"pointer"}}>{ic}</button>
+        ))}
+      </div>
+
+      <Label>Color</Label>
+      <div style={{display:"flex",gap:9,flexWrap:"wrap",marginBottom:6}}>
+        {COLORS.map(c=>(
+          <button key={c} onClick={()=>set("color",c)}
+            style={{width:29,height:29,borderRadius:"50%",background:c,border:f.color===c?"3px solid #fff":"3px solid transparent",cursor:"pointer"}}/>
+        ))}
+      </div>
+
+      <button className="btn-green" style={{marginTop:14}} onClick={save} disabled={!f.name.trim()}>
+        {initial.id ? "Save Changes" : "Create Envelope"}
+      </button>
+    </Sheet>
+  );
+}
+
+// ─── Envelope detail ─────────────────────────────────────────────────────────
+function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, onMarkPaid }) {
+  const [confirmDel, setConfirmDel] = useState(false);
+  const locked = isLocked(env, transactions);
+  const paid = isPaid(env, transactions);
+  const txs = transactions.filter(t => t.envelopeId === env.id).slice(0,10);
+  const risk = promoRisk(env);
+  const variance = scheduleVariance(env);
+  const due = nextDueDate(env);
+  const lock = lockDate(env);
+
+  return (
+    <Sheet onClose={onClose} title={null}>
+      <div style={{textAlign:"center",marginBottom:20}}>
+        <div style={{fontSize:52,marginBottom:10}}>{env.icon}</div>
+        <div style={{fontSize:12,color:"#8e8e93",letterSpacing:".4px",textTransform:"uppercase"}}>{TYPE_META[env.type].label}</div>
+        <div style={{fontSize:24,fontWeight:700,letterSpacing:"-.7px",marginTop:2}}>{env.name}</div>
+        {paid && <div style={{display:"inline-block",marginTop:8,background:"#30d15822",color:"#30d158",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:700}}>✓ PAID THIS PERIOD</div>}
+        {locked && <div style={{display:"inline-block",marginTop:8,marginLeft:6,background:"#ffd60a22",color:"#ffd60a",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:700}}>🔒 LOCKED</div>}
+      </div>
+
+      {env.type === TYPES.DEBT && (
+        <>
+          <div className="card" style={{padding:16,marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+              <div>
+                <div style={{fontSize:11,color:"#8e8e93",textTransform:"uppercase",letterSpacing:".4px"}}>Still owed</div>
+                <div style={{fontSize:28,fontWeight:700,letterSpacing:"-1.2px"}}>{money(env.currentBalance)}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:11,color:"#8e8e93"}}>Started at</div>
+                <div style={{fontSize:15,color:"#8e8e93"}}>{money(env.originalBalance)}</div>
+              </div>
+            </div>
+            <div className="bar" style={{height:8,marginBottom:8}}>
+              <div className="fill" style={{width:`${progress(env)}%`,background:"linear-gradient(90deg,#30d158,#c5f135)"}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12.5}}>
+              <span style={{color:"#30d158",fontWeight:600}}>{Math.round(progress(env))}% paid off</span>
+              {variance !== null && (
+                <span style={{color:variance>=0?"#30d158":"#ff9f0a",fontWeight:600}}>
+                  {variance>=0?`${money(variance)} ahead of plan`:`${money(Math.abs(variance))} behind plan`}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {risk && risk.status !== "ok" && (
+            <div style={{background:"#2a1f08",border:"1px solid #ffd60a44",borderRadius:14,padding:14,marginBottom:10,display:"flex",gap:10}}>
+              <span style={{fontSize:18}}>⚠️</span>
+              <div>
+                <div style={{fontSize:13.5,fontWeight:600,color:"#ffd60a",marginBottom:3}}>0% APR risk</div>
+                <div style={{fontSize:12.5,color:"#d4b95e",lineHeight:1.5}}>{risk.message}</div>
+                {env.postPromoAPR>0 && risk.exposedAmount>0 && (
+                  <div style={{fontSize:12,color:"#ff9f0a",marginTop:6,fontWeight:600}}>
+                    ≈ {money(risk.exposedAmount * (env.postPromoAPR/100))}/yr in interest if that happens
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="grp" style={{marginBottom:12}}>
+        {isBill(env.type) && (
+          <>
+            <DRow k="Next due" v={due ? due.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"}) : "—"} />
+            <DRow k={hasTarget(env.type)?"Suggested payment":"Amount"} v={money(targetAmount(env))} accent />
+            {env.minimumPayment>0 && <DRow k="Minimum payment" v={money(env.minimumPayment)} />}
+            <DRow k="Set aside" v={money(env.funded||0)} />
+            {env.autopay && lock && <DRow k="Locks on" v={lock.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})} />}
+            {paid && <DRow k="Paid this period" v={money(paidThisPeriod(env, transactions))} accent />}
+          </>
+        )}
+        {env.type === TYPES.SPENDING && (
+          <>
+            <DRow k="Monthly budget" v={money(env.monthlyBudget)} />
+            <DRow k="Spent this month" v={money(spentThisMonth(env, transactions))} />
+            <DRow k="Left" v={money((env.monthlyBudget||0) - spentThisMonth(env, transactions))} accent />
+          </>
+        )}
+        {env.type === TYPES.GOAL && (
+          <>
+            <DRow k="Saved" v={money(env.currentBalance||0)} accent />
+            <DRow k="Target" v={money(env.targetAmount)} />
+            <DRow k="Suggested" v={money(suggestedPayment(env))} />
+          </>
+        )}
+      </div>
+
+      {env.paymentUrl && !paid && (
+        <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-green" style={{display:"block",textAlign:"center",textDecoration:"none",marginBottom:8}}>
+          Go pay it ↗
+        </a>
+      )}
+
+      {isBill(env.type) && !paid && (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={onMarkPaid}>Mark as paid</button>
+      )}
+
+      <button className="btn-dim" style={{marginBottom:8}} onClick={onFund} disabled={locked}>
+        {locked ? "🔒 Funds locked" : "Fund / release money"}
+      </button>
+
+      {txs.length > 0 && (
+        <>
+          <Label style={{marginTop:14}}>Recent payments</Label>
+          <div className="grp" style={{marginBottom:12}}>
+            {txs.map(t=>(
+              <div key={t.id} className="row" style={{padding:"11px 14px"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:14,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.desc}</div>
+                  <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>{t.date}</div>
+                </div>
+                <div style={{fontSize:14,fontWeight:600,color:"#aeaeb2"}}>−{money(t.amount)}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div style={{display:"flex",gap:8,marginTop:6}}>
+        <button className="btn-dim" style={{flex:1}} onClick={onEdit}>Edit</button>
+        {!confirmDel ? (
+          <button className="btn-dim" style={{flex:1,color:"#ff375f"}} onClick={()=>setConfirmDel(true)} disabled={locked}>Delete</button>
+        ) : (
+          <button className="btn-dim" style={{flex:1,background:"#ff375f",color:"#fff"}} onClick={onDelete}>Really delete?</button>
+        )}
+      </div>
+    </Sheet>
+  );
+}
+
+// ─── Fund / unfund ───────────────────────────────────────────────────────────
+function FundSheet({ env, sts, transactions, onFund, onUnfund, onClose }) {
+  const [amt, setAmt] = useState("");
+  if (!env) return null;
+  const need = shortfall(env, transactions);
+  const n = parseFloat(amt) || 0;
+
+  return (
+    <Sheet onClose={onClose} title={`Fund ${env.name}`}>
+      <div style={{display:"flex",gap:10,marginBottom:16}}>
+        <div style={{flex:1,background:"#2c2c2e",borderRadius:12,padding:"12px 14px"}}>
+          <div style={{fontSize:11,color:"#8e8e93"}}>Safe to spend</div>
+          <div style={{fontSize:19,fontWeight:700,color:"#c5f135",letterSpacing:"-.6px"}}>{money(sts)}</div>
+        </div>
+        <div style={{flex:1,background:"#2c2c2e",borderRadius:12,padding:"12px 14px"}}>
+          <div style={{fontSize:11,color:"#8e8e93"}}>Set aside here</div>
+          <div style={{fontSize:19,fontWeight:700,letterSpacing:"-.6px"}}>{money(env.funded||0)}</div>
+        </div>
+      </div>
+
+      {need > 0 && (
+        <div style={{background:"#2a2408",border:"1px solid #ffd60a33",borderRadius:11,padding:"10px 13px",marginBottom:14,fontSize:12.5,color:"#ffd60a",lineHeight:1.45}}>
+          Needs {money(need)} more to cover {money(targetAmount(env))}.
+        </div>
+      )}
+
+      <Label>Amount</Label>
+      <input className="in" type="number" value={amt} autoFocus onChange={e=>setAmt(e.target.value)} placeholder="0" />
+
+      <div style={{display:"flex",gap:7,marginTop:9,marginBottom:16}}>
+        {need>0 && <button className="chip" onClick={()=>setAmt(String(Math.min(need,sts)))}>Fill the gap</button>}
+        <button className="chip" onClick={()=>setAmt(String(Math.max(0,Math.floor(sts/2))))}>Half of safe</button>
+        {(env.funded||0)>0 && <button className="chip" onClick={()=>setAmt(String(env.funded))}>All of it</button>}
+      </div>
+
+      <button className="btn-green" onClick={()=>onFund(n)} disabled={n<=0||n>sts} style={{marginBottom:8,opacity:(n<=0||n>sts)?.4:1}}>
+        Move {money(n)} in
+      </button>
+      {(env.funded||0)>0 && (
+        <button className="btn-dim" onClick={()=>onUnfund(n)} disabled={n<=0||n>(env.funded||0)} style={{opacity:(n<=0||n>(env.funded||0))?.4:1}}>
+          Take {money(n)} back out
+        </button>
+      )}
+    </Sheet>
+  );
+}
+
+// ─── Assign a transaction + teach the matcher ────────────────────────────────
+function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
+  const [remember, setRemember] = useState(true);
+  return (
+    <Sheet onClose={onClose} title="Where does this go?">
+      <div className="card" style={{padding:14,marginBottom:14}}>
+        <div style={{fontSize:15,fontWeight:600,marginBottom:3}}>{tx.desc}</div>
+        <div style={{fontSize:13,color:"#8e8e93"}}>{money(tx.amount)} · {tx.date}</div>
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:14}}>
+        {envelopes.map(env=>(
+          <button key={env.id} onClick={()=>onAssign(tx, env.id, remember)}
+            style={{background:"#2c2c2e",border:"none",borderRadius:13,padding:"12px 14px",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",color:"#fff"}}>
+            <span style={{fontSize:21}}>{env.icon}</span>
+            <div style={{flex:1,textAlign:"left"}}>
+              <div style={{fontSize:15,fontWeight:500}}>{env.name}</div>
+              <div style={{fontSize:12,color:"#8e8e93"}}>{TYPE_META[env.type].label}</div>
+            </div>
+            <span style={{color:"#48484a",fontSize:17}}>›</span>
+          </button>
+        ))}
+      </div>
+
+      <button onClick={()=>setRemember(!remember)}
+        style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"12px 14px",width:"100%",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",marginBottom:10}}>
+        <div style={{width:21,height:21,borderRadius:6,background:remember?"#c5f135":"#48484a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#000",flexShrink:0}}>
+          {remember?"✓":""}
+        </div>
+        <div style={{flex:1,textAlign:"left"}}>
+          <div style={{fontSize:13.5,fontWeight:500,color:"#fff"}}>Always match transactions like this</div>
+          <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>Teach it once, never sort this bill again</div>
+        </div>
+      </button>
+
+      <button className="btn-dim" onClick={onSkip} style={{color:"#8e8e93"}}>Skip — not a budget item</button>
+    </Sheet>
+  );
+}
+
+// ─── primitives ──────────────────────────────────────────────────────────────
+function Sheet({ children, onClose, title }) {
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="sheet" onClick={e=>e.stopPropagation()}>
+        <div className="handle"/>
+        {title && (
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px 6px"}}>
+            <span style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>{title}</span>
+            <button className="link" onClick={onClose}>Done</button>
+          </div>
+        )}
+        <div style={{padding: title ? "8px 20px 40px" : "20px 20px 40px"}}>{children}</div>
+      </div>
+    </div>
+  );
+}
+const Label = ({children,style}) => <div style={{fontSize:12.5,color:"#8e8e93",fontWeight:500,margin:"13px 0 6px",...style}}>{children}</div>;
+const Dim = ({children}) => <span style={{color:"#48484a",fontWeight:400}}>{children}</span>;
+const DRow = ({k,v,accent}) => (
+  <div className="row" style={{justifyContent:"space-between",padding:"12px 15px"}}>
+    <span style={{fontSize:14.5,color:"#8e8e93"}}>{k}</span>
+    <span style={{fontSize:14.5,fontWeight:600,color:accent?"#c5f135":"#fff"}}>{v}</span>
+  </div>
+);
+
+// ─── styles ──────────────────────────────────────────────────────────────────
+const S = {
+  app: {fontFamily:"-apple-system,'SF Pro Display','SF Pro Text','Helvetica Neue',sans-serif",background:"#000",minHeight:"100vh",color:"#fff",maxWidth:430,margin:"0 auto",position:"relative",WebkitFontSmoothing:"antialiased"},
+  page: {padding:"20px 22px 110px"},
+};
+
+const CSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+::-webkit-scrollbar{display:none}
+input::placeholder{color:#48484a}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.4)}
+button{-webkit-tap-highlight-color:transparent}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes sheetUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+
+.card{background:#1c1c1e;border-radius:18px;border:none;color:#fff;font-family:inherit}
+.env-card{padding:15px;text-align:left;cursor:pointer;width:100%;transition:opacity .12s}
+.env-card:active{opacity:.6}
+.grp{background:#1c1c1e;border-radius:15px;overflow:hidden}
+.row{padding:13px 15px;display:flex;align-items:center;gap:11px}
+.row+.row{border-top:.5px solid rgba(255,255,255,.08)}
+.ibox{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
+.ibox-lg{width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:21px;flex-shrink:0}
+.bar{background:#2c2c2e;border-radius:3px;height:4px;overflow:hidden}
+.fill{height:100%;border-radius:3px;transition:width .7s cubic-bezier(.25,.46,.45,.94)}
+
+.sec{font-size:12.5px;font-weight:600;color:#636366;text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px}
+.eyebrow{font-size:12px;font-weight:600;color:#636366;letter-spacing:.4px;text-transform:uppercase}
+.tiny-link{background:none;border:none;color:#48484a;font-size:11px;cursor:pointer;font-family:inherit;padding:0;text-decoration:underline}
+
+.tabs{display:flex;border-bottom:.5px solid rgba(255,255,255,.1);margin-top:18px}
+.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:10px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tab.on{color:#c5f135;border-bottom-color:#c5f135}
+
+.tabbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:rgba(0,0,0,.85);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-top:.5px solid rgba(255,255,255,.1);display:flex;padding:10px 0 28px;z-index:40}
+.tb{flex:1;background:none;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9.5px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tb.on{color:#c5f135}
+
+.btn-green{background:#c5f135;color:#000;border:none;border-radius:13px;font-family:inherit;font-size:16px;font-weight:600;letter-spacing:-.3px;padding:15px;cursor:pointer;width:100%;transition:opacity .12s}
+.btn-green:active{opacity:.72}
+.btn-green:disabled{opacity:.4;cursor:default}
+.btn-dim{background:#2c2c2e;color:#fff;border:none;border-radius:13px;font-family:inherit;font-size:14.5px;font-weight:500;padding:13px;cursor:pointer;width:100%;transition:opacity .12s}
+.btn-dim:active{opacity:.6}
+.btn-dim:disabled{opacity:.45;cursor:default}
+.btn-mini{background:#2c2c2e;color:#fff;border:none;border-radius:9px;font-family:inherit;font-size:12.5px;font-weight:600;padding:7px 13px;cursor:pointer;flex:1;text-align:center;display:flex;align-items:center;justify-content:center}
+.chip{background:#2c2c2e;color:#c5f135;border:none;border-radius:9px;font-family:inherit;font-size:12px;font-weight:600;padding:8px 12px;cursor:pointer;flex:1}
+.link{background:none;border:none;color:#c5f135;font-family:inherit;font-size:16px;font-weight:600;cursor:pointer}
+.link:active{opacity:.5}
+
+.in{background:#2c2c2e;border:none;color:#fff;border-radius:11px;padding:13px 15px;width:100%;font-family:inherit;font-size:16px;letter-spacing:-.2px;transition:background .15s;outline:none}
+.in:focus{background:#3a3a3c}
+
+.alert{display:flex;gap:11px;align-items:flex-start;border-radius:14px;padding:13px 15px;margin-bottom:8px;width:100%;cursor:pointer;font-family:inherit;border:1px solid;background:#1c1c1e;color:#fff;transition:opacity .12s}
+.alert:active{opacity:.7}
+.alert.critical{background:#2a0d12;border-color:#ff375f66}
+.alert.warn{background:#2a2108;border-color:#ffd60a44}
+.alert.info{background:#1c1c1e;border-color:#2c2c2e}
+
+.badge{background:#ff375f;border-radius:9px;padding:2px 7px;font-size:11.5px;font-weight:700;color:#fff}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;flex-direction:column;justify-content:flex-end;animation:fadeIn .2s;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.sheet{background:#1c1c1e;border-radius:20px 20px 0 0;width:100%;max-width:430px;margin:0 auto;animation:sheetUp .3s cubic-bezier(.32,1,.23,1);max-height:90vh;overflow-y:auto}
+.handle{width:34px;height:4px;background:#48484a;border-radius:2px;margin:11px auto 0}
+.toast{position:fixed;bottom:98px;left:50%;transform:translateX(-50%);background:rgba(44,44,46,.97);backdrop-filter:blur(24px);border-radius:20px;padding:11px 19px;font-size:14.5px;font-weight:500;white-space:nowrap;z-index:200;animation:toastIn .26s cubic-bezier(.32,1,.23,1);max-width:90vw;overflow:hidden;text-overflow:ellipsis}
+`;
