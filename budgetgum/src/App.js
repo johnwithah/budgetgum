@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { usePlaidLink } from "react-plaid-link";
 import {
   TYPES, TYPE_META, isBill, hasTarget,
-  nextDueDate, lockDate, isLocked, daysUntilLock, isPaid, paidThisPeriod, periodKey,
+  nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
   safeToSpend, shortfall, upcomingLocks, buildAlerts,
   matchEnvelope, normalizeMerchant,
@@ -106,7 +106,7 @@ export default function App() {
   const [transactions, setTransactions] = usePersisted("bg_transactions", []);
   const [accounts, setAccounts]         = usePersisted("bg_accounts", []);
   const [unmapped, setUnmapped]         = usePersisted("bg_unmapped", []);
-  const [lastSync, setLastSync]         = usePersisted("bg_last_sync", null);
+  const [, setLastSync]                 = usePersisted("bg_last_sync", null);
 
   const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState(null);
