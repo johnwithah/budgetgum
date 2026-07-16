@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { usePlaidLink } from "react-plaid-link";
+import { useCloudState, EMPTY_STATE } from "./useCloudState";
 import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey,
@@ -8,16 +9,6 @@ import {
   matchEnvelope, normalizeMerchant,
   money, daysBetween, DOW,
 } from "./engine";
-
-// ─── persistence ──────────────────────────────────────────────────────────────
-function usePersisted(key, def) {
-  const [val, set] = useState(() => {
-    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : def; }
-    catch { return def; }
-  });
-  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }, [key, val]);
-  return [val, set];
-}
 
 const api = (path, body) =>
   fetch(path, {
@@ -30,8 +21,6 @@ const api = (path, body) =>
 const ICONS  = ["💳","🏦","🏠","⚡","🚗","🛒","🍕","🎬","💊","✈️","🎓","📱","🐾","🏋️","🎮","💰","🎯","📚"];
 const COLORS = ["#30d158","#0a84ff","#ffd60a","#bf5af2","#ff375f","#ff9f0a","#64d2ff","#5e5ce6","#ff6961","#34c759"];
 
-// ═════════════════════════════════════════════════════════════════════════════
-// LOCK SCREEN
 // ═════════════════════════════════════════════════════════════════════════════
 function LockScreen({ onUnlock }) {
   const [pw, setPw] = useState(""); const [err, setErr] = useState(null); const [busy, setBusy] = useState(false);
@@ -95,41 +84,46 @@ function PlaidButton({ onLinked, onError, label = "🏦  Connect Your Bank" }) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// MAIN
-// ═════════════════════════════════════════════════════════════════════════════
 export default function App() {
   const [authState, setAuthState] = useState("checking");
   const [bankConnected, setBankConnected] = useState(false);
 
-  const [tab, setTab] = useState("home");
-  const [envelopes, setEnvelopes]       = usePersisted("bg_envelopes", []);   // ← empty. no fake data.
-  const [transactions, setTransactions] = usePersisted("bg_transactions", []);
-  const [accounts, setAccounts]         = usePersisted("bg_accounts", []);
-  const [unmapped, setUnmapped]         = usePersisted("bg_unmapped", []);
-  const [, setLastSync]                 = usePersisted("bg_last_sync", null);
+  // ── THE BIG CHANGE ────────────────────────────────────────────────────────
+  // One state object, living on the server. Every device reads the same row.
+  // localStorage is now just a cache so the app renders instantly offline.
+  const [state, setState, syncStatus, saveNow] = useCloudState(authState === "unlocked");
+  const { envelopes, transactions, accounts, unmapped } = state;
 
+  // Thin wrappers so every existing call site still reads naturally.
+  const setEnvelopes    = useCallback(u => setState(s => ({...s, envelopes:    typeof u==="function" ? u(s.envelopes)    : u})), [setState]);
+  const setTransactions = useCallback(u => setState(s => ({...s, transactions: typeof u==="function" ? u(s.transactions) : u})), [setState]);
+  const setAccounts     = useCallback(u => setState(s => ({...s, accounts:     typeof u==="function" ? u(s.accounts)     : u})), [setState]);
+  const setUnmapped     = useCallback(u => setState(s => ({...s, unmapped:     typeof u==="function" ? u(s.unmapped)     : u})), [setState]);
+  const setLastSync     = useCallback(v => setState(s => ({...s, lastSync: v})), [setState]);
+
+  const [tab, setTab] = useState("home");
   const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState(null);
-  const [editEnv, setEditEnv] = useState(null);       // envelope being created/edited
-  const [detailEnv, setDetailEnv] = useState(null);   // envelope detail sheet
-  const [fundEnv, setFundEnv] = useState(null);       // fund/unfund sheet
-  const [mapTx, setMapTx] = useState(null);           // assign-transaction sheet
+  const [editEnv, setEditEnv] = useState(null);
+  const [detailEnv, setDetailEnv] = useState(null);
+  const [fundEnv, setFundEnv] = useState(null);
+  const [mapTx, setMapTx] = useState(null);
+  const [settings, setSettings] = useState(false);
 
   const checkingBalance = useMemo(
-    () => accounts.filter(a => a.type === "depository" && a.subtype !== "savings")
-                  .reduce((s,a) => s + (a.available ?? a.balance ?? 0), 0),
+    () => (accounts||[]).filter(a => a.type === "depository" && a.subtype !== "savings")
+                        .reduce((s,a) => s + (a.available ?? a.balance ?? 0), 0),
     [accounts]
   );
 
-  const sts     = safeToSpend(envelopes, checkingBalance);
-  const alerts  = useMemo(() => buildAlerts(envelopes, transactions, checkingBalance), [envelopes, transactions, checkingBalance]);
-  const locks   = useMemo(() => upcomingLocks(envelopes, transactions), [envelopes, transactions]);
-  const bills   = envelopes.filter(e => isBill(e.type));
-  const debts   = envelopes.filter(e => e.type === TYPES.DEBT);
+  const sts    = safeToSpend(envelopes, checkingBalance);
+  const alerts = useMemo(() => buildAlerts(envelopes, transactions, checkingBalance), [envelopes, transactions, checkingBalance]);
+  const locks  = useMemo(() => upcomingLocks(envelopes, transactions), [envelopes, transactions]);
+  const bills  = envelopes.filter(e => isBill(e.type));
+  const debts  = envelopes.filter(e => e.type === TYPES.DEBT);
 
   function showToast(m) { setToast(m); setTimeout(()=>setToast(null), 3200); }
 
-  // ── session ──
   const checkSession = useCallback(async () => {
     try {
       const r = await fetch("/api/session", { credentials: "same-origin" });
@@ -140,42 +134,28 @@ export default function App() {
   }, []);
   useEffect(() => { checkSession(); }, [checkSession]);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // AUTO-FUND ON LOCK DAY
-  //
-  // When an autopay envelope's lock window opens, we pull from Safe to Spend to
-  // fill it — up to what it needs, or up to what's actually there. If there
-  // isn't enough, we fund what we can and let the alert scream about it. The
-  // money is leaving the account either way; the envelope should say so.
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ── Auto-fund on lock day ─────────────────────────────────────────────────
   useEffect(() => {
     if (authState !== "unlocked" || !envelopes.length) return;
-
     let available = sts;
     let changed = false;
     const next = envelopes.map(env => {
       if (!env.autopay || !isBill(env.type)) return env;
       if (isPaid(env, transactions)) return env;
       if (!isLocked(env, transactions)) return env;
-
       const need = targetAmount(env) - (env.funded || 0);
       if (need <= 0) return env;
-
       const grab = Math.min(need, Math.max(0, available));
       if (grab <= 0) return env;
-
       available -= grab;
       changed = true;
       return { ...env, funded: (env.funded || 0) + grab };
     });
-
     if (changed) setEnvelopes(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authState, envelopes.length, transactions.length]);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SYNC — the moment reality overwrites the plan
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ── Sync with bank ────────────────────────────────────────────────────────
   const syncBank = useCallback(async () => {
     setSyncing(true);
     try {
@@ -189,11 +169,8 @@ export default function App() {
         setSyncing(false); return;
       }
 
-      setAccounts(d.accounts || []);
-
       const seen = new Set(transactions.map(t => t.id));
       const fresh = (d.transactions || []).filter(t => !seen.has(t.id) && !t.pending);
-
       const matched = [], needsAssign = [];
       fresh.forEach(t => {
         const envId = matchEnvelope(t, envelopes);
@@ -201,50 +178,36 @@ export default function App() {
         else needsAssign.push(t);
       });
 
-      if (matched.length) {
-        setTransactions(p => [...matched, ...p]);
-        setEnvelopes(p => p.map(env => applyPayments(env, matched.filter(t => t.envelopeId === env.id))));
-      }
-      if (needsAssign.length) setUnmapped(p => [...needsAssign, ...p]);
+      // One atomic state update — keeps the server write consistent.
+      setState(s => ({
+        ...s,
+        accounts: d.accounts || [],
+        transactions: matched.length ? [...matched, ...s.transactions] : s.transactions,
+        envelopes: matched.length
+          ? s.envelopes.map(env => applyPayments(env, matched.filter(t => t.envelopeId === env.id)))
+          : s.envelopes,
+        unmapped: needsAssign.length ? [...needsAssign, ...s.unmapped] : s.unmapped,
+        lastSync: new Date().toISOString(),
+      }));
 
-      setLastSync(new Date().toISOString());
       showToast(`Synced — ${fresh.length} new`);
     } catch { showToast("Sync failed"); }
     setSyncing(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transactions, envelopes]);
+  }, [transactions, envelopes, setState]);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // THE RELEASE MECHANIC — the heart of it
-  //
-  // Amex envelope funded $1,000. Payment clears for $600.
-  //
-  //   • balance drops by the REAL $600, not the planned $1,000
-  //   • the envelope settles: funded → 0
-  //   • the unspent $400 stops being reserved, so Safe to Spend rises by $400
-  //
-  // You never correct anything. You never remember anything. The bank told us
-  // what happened and the budget rearranged itself around it.
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ── The release mechanic ──────────────────────────────────────────────────
   function applyPayments(env, payments) {
     if (!payments.length) return env;
     const total = payments.reduce((s,t) => s + t.amount, 0);
     let next = { ...env };
-
-    if (env.type === TYPES.DEBT) {
-      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
-    } else if (env.type === TYPES.GOAL) {
-      next.currentBalance = (env.currentBalance || 0) + total;
-    }
-
-    // Settle: release whatever was reserved but not spent.
+    if (env.type === TYPES.DEBT)      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
+    else if (env.type === TYPES.GOAL) next.currentBalance = (env.currentBalance || 0) + total;
     if (isBill(env.type)) next.funded = 0;
     else next.funded = Math.max(0, (env.funded || 0) - total);
-
     return next;
   }
 
-  // ── funding ──
   function fund(envId, amount) {
     if (amount <= 0) return;
     if (amount > sts) { showToast("Not enough safe to spend"); return; }
@@ -260,18 +223,12 @@ export default function App() {
     showToast(`Released ${money(take)}`);
   }
 
-  // ── envelopes ──
   function saveEnvelope(data) {
     if (data.id) {
       setEnvelopes(p => p.map(e => e.id === data.id ? { ...e, ...data } : e));
       showToast("Envelope updated");
     } else {
-      const created = {
-        ...data,
-        id: `env_${Date.now()}`,
-        funded: 0,
-        matchPatterns: data.matchPatterns || [],
-      };
+      const created = { ...data, id: `env_${Date.now()}`, funded: 0, matchPatterns: data.matchPatterns || [] };
       if (data.type === TYPES.DEBT) {
         created.originalBalance = data.currentBalance;
         created.startDate = new Date().toISOString().split("T")[0];
@@ -285,28 +242,33 @@ export default function App() {
   function deleteEnvelope(id) {
     const env = envelopes.find(e => e.id === id);
     if (env && isLocked(env, transactions)) { showToast("🔒 Can't delete — autopay locked"); return; }
-    setEnvelopes(p => p.filter(e => e.id !== id));
-    setTransactions(p => p.map(t => t.envelopeId === id ? { ...t, envelopeId: null } : t));
+    setState(s => ({
+      ...s,
+      envelopes: s.envelopes.filter(e => e.id !== id),
+      transactions: s.transactions.map(t => t.envelopeId === id ? { ...t, envelopeId: null } : t),
+    }));
     setDetailEnv(null);
     showToast("Envelope deleted");
   }
 
-  // ── assign a transaction, and optionally teach the matcher ──
   function assignTx(tx, envId, remember) {
     const assigned = { ...tx, envelopeId: envId };
-    setTransactions(p => [assigned, ...p]);
-    setEnvelopes(p => p.map(e => {
-      if (e.id !== envId) return e;
-      let next = applyPayments(e, [assigned]);
-      if (remember) {
-        const pattern = normalizeMerchant(tx.desc);
-        if (pattern && !(next.matchPatterns||[]).includes(pattern)) {
-          next.matchPatterns = [...(next.matchPatterns||[]), pattern];
+    setState(s => ({
+      ...s,
+      transactions: [assigned, ...s.transactions],
+      unmapped: s.unmapped.filter(t => t.id !== tx.id),
+      envelopes: s.envelopes.map(e => {
+        if (e.id !== envId) return e;
+        let next = applyPayments(e, [assigned]);
+        if (remember) {
+          const pattern = normalizeMerchant(tx.desc);
+          if (pattern && !(next.matchPatterns||[]).includes(pattern)) {
+            next.matchPatterns = [...(next.matchPatterns||[]), pattern];
+          }
         }
-      }
-      return next;
+        return next;
+      }),
     }));
-    setUnmapped(p => p.filter(t => t.id !== tx.id));
     setMapTx(null);
     showToast(remember ? "Assigned — will auto-match next time" : "Assigned");
   }
@@ -319,7 +281,6 @@ export default function App() {
   async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
   async function logout() { await api("/api/logout").catch(()=>{}); setAuthState("locked"); }
 
-  // ── gates ──
   if (authState === "checking")
     return <div style={{background:"#000",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{fontSize:44,opacity:.35}}>🍬</div></div>;
   if (authState === "locked") return <LockScreen onUnlock={checkSession} />;
@@ -327,16 +288,16 @@ export default function App() {
   return (
     <div style={S.app}>
       <style>{CSS}</style>
-
       {toast && <div className="toast">{toast}</div>}
 
-      {/* ═══ HEADER — Safe to Spend is the hero number ═══ */}
+      {/* ═══ HEADER ═══ */}
       <div style={{padding:"24px 22px 0"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
           <div>
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
               <span className="eyebrow">🍬 Budgetgum</span>
-              <button onClick={logout} className="tiny-link">Lock</button>
+              <SyncDot status={syncStatus} />
+              <button onClick={()=>setSettings(true)} className="tiny-link">Settings</button>
             </div>
             <div style={{fontSize:44,fontWeight:700,letterSpacing:"-2.2px",lineHeight:1,color:sts>=0?"#c5f135":"#ff375f"}}>
               {money(sts)}
@@ -381,14 +342,11 @@ export default function App() {
       {/* ═══ HOME ═══ */}
       {tab === "home" && (
         <div style={S.page}>
-          {/* Alerts — critical first */}
           {alerts.length > 0 && (
             <div style={{marginBottom:24}}>
               {alerts.slice(0,4).map((a,i) => (
                 <button key={i} className={`alert ${a.level}`} onClick={()=>setDetailEnv(a.env)}>
-                  <span style={{fontSize:18,flexShrink:0}}>
-                    {a.level==="critical"?"🚨":a.level==="warn"?"⚠️":"🔔"}
-                  </span>
+                  <span style={{fontSize:18,flexShrink:0}}>{a.level==="critical"?"🚨":a.level==="warn"?"⚠️":"🔔"}</span>
                   <div style={{flex:1,textAlign:"left"}}>
                     <div style={{fontSize:14,fontWeight:600,letterSpacing:"-.2px"}}>{a.title}</div>
                     <div style={{fontSize:12,color:"#aeaeb2",marginTop:2,lineHeight:1.4}}>{a.body}</div>
@@ -398,7 +356,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ── THE FORECAST — the screen that does the real work ── */}
           {locks.length > 0 && (
             <div style={{marginBottom:24}}>
               <div className="sec">Locking Soon</div>
@@ -494,9 +451,7 @@ export default function App() {
             </div>
           ) : (
             <div style={{display:"flex",flexDirection:"column",gap:9}}>
-              {bills
-                .slice()
-                .sort((a,b) => (nextDueDate(a)||0) - (nextDueDate(b)||0))
+              {bills.slice().sort((a,b) => (nextDueDate(a)||0) - (nextDueDate(b)||0))
                 .map(env => <BillRow key={env.id} env={env} transactions={transactions}
                     onOpen={()=>setDetailEnv(env)} onMarkPaid={()=>markPaid(env)} />)}
             </div>
@@ -544,7 +499,6 @@ export default function App() {
         </div>
       )}
 
-      {/* ═══ TAB BAR ═══ */}
       <div className="tabbar">
         {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,l])=>(
           <button key={t} onClick={()=>setTab(t)} className={`tb ${tab===t?"on":""}`}>
@@ -554,6 +508,10 @@ export default function App() {
       </div>
 
       {/* ═══ SHEETS ═══ */}
+      {settings  && <SettingsSheet state={state} saveNow={saveNow} syncStatus={syncStatus}
+                      bankConnected={bankConnected}
+                      onDisconnectBank={async()=>{ await api("/api/disconnect_bank"); setBankConnected(false); setAccounts([]); showToast("Bank disconnected"); }}
+                      onLogout={logout} onClose={()=>setSettings(false)} onToast={showToast} />}
       {editEnv   && <EnvelopeForm initial={editEnv} onSave={saveEnvelope} onCancel={()=>setEditEnv(null)} />}
       {detailEnv && <EnvelopeDetail env={envelopes.find(e=>e.id===detailEnv.id) || detailEnv}
                       transactions={transactions}
@@ -575,7 +533,132 @@ export default function App() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// COMPONENTS
+// SYNC INDICATOR — a quiet dot. You should be able to trust it without watching it.
+// ═════════════════════════════════════════════════════════════════════════════
+function SyncDot({ status }) {
+  const map = {
+    idle:    { c: "#30d158", t: "Synced" },
+    loading: { c: "#8e8e93", t: "Loading…" },
+    saving:  { c: "#ffd60a", t: "Saving…" },
+    saved:   { c: "#30d158", t: "Saved" },
+    error:   { c: "#ff375f", t: "Offline — saved on this device only" },
+  };
+  const s = map[status] || map.idle;
+  return (
+    <span title={s.t} style={{display:"inline-flex",alignItems:"center",gap:4}}>
+      <span style={{width:6,height:6,borderRadius:3,background:s.c,display:"inline-block",
+                    animation: status==="saving"||status==="loading" ? "pulse 1s infinite" : "none"}}/>
+      {status === "error" && <span style={{fontSize:10,color:"#ff375f"}}>offline</span>}
+    </span>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SETTINGS — backup, restore, bank, lock
+// ═════════════════════════════════════════════════════════════════════════════
+function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnectBank, onLogout, onClose, onToast }) {
+  const [restoring, setRestoring] = useState(false);
+  const [json, setJson] = useState("");
+  const [confirmWipe, setConfirmWipe] = useState(false);
+
+  function exportBackup() {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `budgetgum-backup-${new Date().toISOString().split("T")[0]}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    onToast("Backup downloaded");
+  }
+
+  async function doRestore() {
+    let parsed;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      onToast("That's not valid JSON");
+      return;
+    }
+    if (!Array.isArray(parsed.envelopes)) {
+      onToast("No envelopes found in that backup");
+      return;
+    }
+    await saveNow({ ...EMPTY_STATE, ...parsed });
+    onToast(`Restored ${parsed.envelopes.length} envelopes`);
+    setRestoring(false);
+    setJson("");
+    onClose();
+  }
+
+  async function wipe() {
+    await saveNow(EMPTY_STATE);
+    onToast("Everything cleared");
+    onClose();
+  }
+
+  return (
+    <Sheet onClose={onClose} title="Settings">
+      <div className="grp" style={{marginBottom:14}}>
+        <div className="row" style={{justifyContent:"space-between"}}>
+          <span style={{fontSize:14.5,color:"#8e8e93"}}>Sync</span>
+          <span style={{fontSize:14.5,fontWeight:600,color:syncStatus==="error"?"#ff375f":"#30d158"}}>
+            {syncStatus==="error" ? "Offline" : "On"}
+          </span>
+        </div>
+        <div className="row" style={{justifyContent:"space-between"}}>
+          <span style={{fontSize:14.5,color:"#8e8e93"}}>Envelopes</span>
+          <span style={{fontSize:14.5,fontWeight:600}}>{state.envelopes.length}</span>
+        </div>
+        <div className="row" style={{justifyContent:"space-between"}}>
+          <span style={{fontSize:14.5,color:"#8e8e93"}}>Transactions</span>
+          <span style={{fontSize:14.5,fontWeight:600}}>{state.transactions.length}</span>
+        </div>
+      </div>
+
+      <div style={{fontSize:12,color:"#636366",lineHeight:1.55,marginBottom:14,padding:"0 2px"}}>
+        Your budget is stored on the server and syncs across every device you sign into.
+        Download a backup anyway — it costs nothing and it's yours.
+      </div>
+
+      <button className="btn-dim" style={{marginBottom:8}} onClick={exportBackup}>Download backup</button>
+
+      {!restoring ? (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setRestoring(true)}>Restore from backup</button>
+      ) : (
+        <div className="card" style={{padding:14,marginBottom:8}}>
+          <div style={{fontSize:13,color:"#8e8e93",marginBottom:8,lineHeight:1.5}}>
+            Paste a backup JSON. This <strong style={{color:"#ff9f0a"}}>replaces everything</strong> currently in the app.
+          </div>
+          <textarea value={json} onChange={e=>setJson(e.target.value)} placeholder='{"envelopes":[...]}'
+            style={{background:"#2c2c2e",border:"none",color:"#fff",borderRadius:10,padding:12,width:"100%",height:120,
+                    fontFamily:"ui-monospace,monospace",fontSize:11.5,resize:"vertical",outline:"none",marginBottom:8}}/>
+          <div style={{display:"flex",gap:8}}>
+            <button className="btn-dim" style={{flex:1}} onClick={()=>{setRestoring(false);setJson("");}}>Cancel</button>
+            <button className="btn-green" style={{flex:1,fontSize:14,padding:13}} onClick={doRestore} disabled={!json.trim()}>Restore</button>
+          </div>
+        </div>
+      )}
+
+      {bankConnected && (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={onDisconnectBank}>Disconnect bank</button>
+      )}
+
+      <button className="btn-dim" style={{marginBottom:8}} onClick={onLogout}>Lock app</button>
+
+      {!confirmWipe ? (
+        <button className="btn-dim" style={{color:"#ff375f"}} onClick={()=>setConfirmWipe(true)}>Erase all data</button>
+      ) : (
+        <button className="btn-dim" style={{background:"#ff375f",color:"#fff"}} onClick={wipe}>
+          Really erase everything?
+        </button>
+      )}
+    </Sheet>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (Components below are unchanged from v2)
 // ═════════════════════════════════════════════════════════════════════════════
 
 function EmptyState({ onAdd }) {
@@ -594,7 +677,6 @@ function EmptyState({ onAdd }) {
 function EnvCard({ env, transactions, onClick }) {
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
-
   let big, small, pct, barColor;
   if (env.type === TYPES.SPENDING) {
     const spent = spentThisMonth(env, transactions);
@@ -613,13 +695,12 @@ function EnvCard({ env, transactions, onClick }) {
     pct = paid?100:Math.min(100,((env.funded||0)/(env.billAmount||1))*100);
     barColor = paid?"#30d158":env.color;
   }
-
   return (
     <button className="card env-card" onClick={onClick}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
         <span style={{fontSize:26}}>{env.icon}</span>
         <div style={{display:"flex",gap:3}}>
-          {locked && <span title="Locked" style={{fontSize:13}}>🔒</span>}
+          {locked && <span style={{fontSize:13}}>🔒</span>}
           {paid && <span style={{fontSize:13,color:"#30d158"}}>✓</span>}
         </div>
       </div>
@@ -628,7 +709,7 @@ function EnvCard({ env, transactions, onClick }) {
       <div style={{fontSize:11,color:"#48484a",marginBottom:9}}>{small}</div>
       <div className="bar"><div className="fill" style={{width:`${pct}%`,background:barColor}}/></div>
       {(env.funded||0) > 0 && (
-        <div style={{fontSize:10,color:locked?"#ffd60a":"#8e8e93",marginTop:6,letterSpacing:".2px"}}>
+        <div style={{fontSize:10,color:locked?"#ffd60a":"#8e8e93",marginTop:6}}>
           {locked ? "🔒 " : ""}{money(env.funded)} set aside
         </div>
       )}
@@ -641,7 +722,6 @@ function EnvRow({ env, transactions, onOpen, onFund }) {
   const paid = isPaid(env, transactions);
   const short = shortfall(env, transactions);
   const due = nextDueDate(env);
-
   return (
     <div className="card" style={{padding:16}}>
       <div style={{display:"flex",alignItems:"center",gap:12,cursor:"pointer"}} onClick={onOpen}>
@@ -660,7 +740,6 @@ function EnvRow({ env, transactions, onOpen, onFund }) {
         </div>
         <span style={{color:"#48484a",fontSize:18}}>›</span>
       </div>
-
       {isBill(env.type) && !paid && (
         <div style={{marginTop:12,paddingTop:12,borderTop:".5px solid rgba(255,255,255,.07)"}}>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:6}}>
@@ -687,7 +766,6 @@ function BillRow({ env, transactions, onOpen, onMarkPaid }) {
   const amt = targetAmount(env);
   const actual = paidThisPeriod(env, transactions);
   const urg = days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
-
   return (
     <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1}}>
       <div style={{display:"flex",alignItems:"center",gap:11}}>
@@ -710,9 +788,7 @@ function BillRow({ env, transactions, onOpen, onMarkPaid }) {
       {!paid && (
         <div style={{display:"flex",gap:8,marginTop:11}}>
           {env.paymentUrl && (
-            <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-mini" style={{background:"#c5f135",color:"#000",textDecoration:"none"}}>
-              Pay now ↗
-            </a>
+            <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-mini" style={{background:"#c5f135",color:"#000",textDecoration:"none"}}>Pay now ↗</a>
           )}
           <button className="btn-mini" onClick={onMarkPaid}>Mark paid</button>
         </div>
@@ -727,7 +803,6 @@ function DebtCard({ env, onClick }) {
   const risk = promoRisk(env);
   const sugg = suggestedPayment(env);
   const orig = env.originalBalance || 0;
-
   return (
     <button className="card" onClick={onClick} style={{padding:17,textAlign:"left",width:"100%",border:risk&&risk.status!=="ok"?"1px solid #ffd60a44":"none"}}>
       <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:13}}>
@@ -743,11 +818,9 @@ function DebtCard({ env, onClick }) {
           <div style={{fontSize:11,color:"#48484a"}}>of {money(orig)}</div>
         </div>
       </div>
-
       <div className="bar" style={{height:7,marginBottom:8}}>
         <div className="fill" style={{width:`${pct}%`,background:"linear-gradient(90deg,#30d158,#c5f135)"}}/>
       </div>
-
       <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:12}}>
         <span style={{color:"#30d158",fontWeight:600}}>{Math.round(pct)}% paid off</span>
         {variance !== null && (
@@ -756,17 +829,13 @@ function DebtCard({ env, onClick }) {
           </span>
         )}
       </div>
-
       <div style={{background:"#2c2c2e",borderRadius:10,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <div style={{fontSize:11,color:"#8e8e93"}}>Suggested {env.frequency||"monthly"}</div>
           <div style={{fontSize:17,fontWeight:700,letterSpacing:"-.5px",color:"#c5f135"}}>{money(sugg)}</div>
         </div>
-        <div style={{fontSize:11,color:"#48484a",textAlign:"right",maxWidth:130,lineHeight:1.4}}>
-          to finish on time
-        </div>
+        <div style={{fontSize:11,color:"#48484a",textAlign:"right",maxWidth:130,lineHeight:1.4}}>to finish on time</div>
       </div>
-
       {risk && risk.status !== "ok" && (
         <div style={{marginTop:10,background:"#2a1f08",border:"1px solid #ffd60a33",borderRadius:10,padding:"9px 11px",display:"flex",gap:8,alignItems:"flex-start"}}>
           <span style={{fontSize:14}}>⚠️</span>
@@ -774,77 +843,47 @@ function DebtCard({ env, onClick }) {
         </div>
       )}
       {risk && risk.status === "ok" && (
-        <div style={{marginTop:8,fontSize:11,color:"#30d158",textAlign:"center"}}>
-          0% APR — {risk.daysLeft} days left
-        </div>
+        <div style={{marginTop:8,fontSize:11,color:"#30d158",textAlign:"center"}}>0% APR — {risk.daysLeft} days left</div>
       )}
     </button>
   );
 }
 
-// ─── Envelope create/edit form ───────────────────────────────────────────────
 function EnvelopeForm({ initial, onSave, onCancel }) {
   const [f, setF] = useState({
     type: initial.type || TYPES.SPENDING,
-    name: initial.name || "",
-    icon: initial.icon || "💳",
-    color: initial.color || "#0a84ff",
-    monthlyBudget: initial.monthlyBudget || "",
-    billAmount: initial.billAmount || "",
-    currentBalance: initial.currentBalance || "",
-    targetAmount: initial.targetAmount || "",
-    targetDate: initial.targetDate || "",
-    frequency: initial.frequency || "monthly",
-    dueDay: initial.dueDay ?? 1,
-    annualDate: initial.annualDate || "01-01",
-    minimumPayment: initial.minimumPayment || "",
-    promoEndDate: initial.promoEndDate || "",
-    postPromoAPR: initial.postPromoAPR || "",
-    paymentUrl: initial.paymentUrl || "",
-    autopay: initial.autopay || false,
-    autopayLeadDays: initial.autopayLeadDays ?? 5,
-    id: initial.id,
-    matchPatterns: initial.matchPatterns || [],
+    name: initial.name || "", icon: initial.icon || "💳", color: initial.color || "#0a84ff",
+    monthlyBudget: initial.monthlyBudget || "", billAmount: initial.billAmount || "",
+    currentBalance: initial.currentBalance || "", targetAmount: initial.targetAmount || "",
+    targetDate: initial.targetDate || "", frequency: initial.frequency || "monthly",
+    dueDay: initial.dueDay ?? 1, annualDate: initial.annualDate || "01-01",
+    minimumPayment: initial.minimumPayment || "", promoEndDate: initial.promoEndDate || "",
+    postPromoAPR: initial.postPromoAPR || "", paymentUrl: initial.paymentUrl || "",
+    autopay: initial.autopay || false, autopayLeadDays: initial.autopayLeadDays ?? 5,
+    id: initial.id, matchPatterns: initial.matchPatterns || [],
   });
   const set = (k,v) => setF(p => ({...p,[k]:v}));
-
   const bill = isBill(f.type);
   const target = hasTarget(f.type);
 
-  // Live preview of the suggested payment as they type — the "aha" moment.
   const preview = useMemo(() => {
     if (!target || !f.targetDate) return null;
-    const fake = {
-      ...f,
-      type: f.type,
-      currentBalance: parseFloat(f.currentBalance) || 0,
-      targetAmount: parseFloat(f.targetAmount) || 0,
-      dueDay: parseInt(f.dueDay) || 1,
-    };
-    const s = suggestedPayment(fake);
+    const s = suggestedPayment({...f, currentBalance: parseFloat(f.currentBalance)||0,
+      targetAmount: parseFloat(f.targetAmount)||0, dueDay: parseInt(f.dueDay)||1});
     return s > 0 ? s : null;
   }, [f, target]);
 
   function save() {
     if (!f.name.trim()) return;
-    const out = {
-      ...f,
-      name: f.name.trim(),
-      monthlyBudget: parseFloat(f.monthlyBudget) || 0,
-      billAmount: parseFloat(f.billAmount) || 0,
-      currentBalance: parseFloat(f.currentBalance) || 0,
-      targetAmount: parseFloat(f.targetAmount) || 0,
-      minimumPayment: parseFloat(f.minimumPayment) || 0,
-      postPromoAPR: parseFloat(f.postPromoAPR) || 0,
-      dueDay: parseInt(f.dueDay) || 1,
-      autopayLeadDays: parseInt(f.autopayLeadDays) || 5,
-    };
-    onSave(out);
+    onSave({ ...f, name: f.name.trim(),
+      monthlyBudget: parseFloat(f.monthlyBudget)||0, billAmount: parseFloat(f.billAmount)||0,
+      currentBalance: parseFloat(f.currentBalance)||0, targetAmount: parseFloat(f.targetAmount)||0,
+      minimumPayment: parseFloat(f.minimumPayment)||0, postPromoAPR: parseFloat(f.postPromoAPR)||0,
+      dueDay: parseInt(f.dueDay)||1, autopayLeadDays: parseInt(f.autopayLeadDays)||5 });
   }
 
   return (
     <Sheet onClose={onCancel} title={initial.id ? "Edit Envelope" : "New Envelope"}>
-      {/* Type picker */}
       {!initial.id && (
         <>
           <Label>Type</Label>
@@ -864,20 +903,11 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
       <Label>Name</Label>
       <input className="in" value={f.name} onChange={e=>set("name",e.target.value)} placeholder={f.type===TYPES.DEBT?"Amex Blue Cash":"Groceries"} />
 
-      {/* Type-specific fields */}
-      {f.type === TYPES.SPENDING && (
-        <>
-          <Label>Monthly budget</Label>
-          <input className="in" type="number" value={f.monthlyBudget} onChange={e=>set("monthlyBudget",e.target.value)} placeholder="600" />
-        </>
-      )}
+      {f.type === TYPES.SPENDING && (<><Label>Monthly budget</Label>
+        <input className="in" type="number" value={f.monthlyBudget} onChange={e=>set("monthlyBudget",e.target.value)} placeholder="600" /></>)}
 
-      {f.type === TYPES.RECURRING && (
-        <>
-          <Label>Amount</Label>
-          <input className="in" type="number" value={f.billAmount} onChange={e=>set("billAmount",e.target.value)} placeholder="15.99" />
-        </>
-      )}
+      {f.type === TYPES.RECURRING && (<><Label>Amount</Label>
+        <input className="in" type="number" value={f.billAmount} onChange={e=>set("billAmount",e.target.value)} placeholder="15.99" /></>)}
 
       {f.type === TYPES.DEBT && (
         <>
@@ -889,12 +919,8 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
           <input className="in" type="number" value={f.minimumPayment} onChange={e=>set("minimumPayment",e.target.value)} placeholder="35" />
           <Label>0% APR ends <Dim>(optional — but this is the one that matters)</Dim></Label>
           <input className="in" type="date" value={f.promoEndDate} onChange={e=>set("promoEndDate",e.target.value)} />
-          {f.promoEndDate && (
-            <>
-              <Label>Rate after 0% <Dim>(optional)</Dim></Label>
-              <input className="in" type="number" value={f.postPromoAPR} onChange={e=>set("postPromoAPR",e.target.value)} placeholder="24.99" />
-            </>
-          )}
+          {f.promoEndDate && (<><Label>Rate after 0% <Dim>(optional)</Dim></Label>
+            <input className="in" type="number" value={f.postPromoAPR} onChange={e=>set("postPromoAPR",e.target.value)} placeholder="24.99" /></>)}
         </>
       )}
 
@@ -909,7 +935,6 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
         </>
       )}
 
-      {/* Schedule — bills and targets both need one */}
       {(bill || target) && (
         <>
           <Label>How often</Label>
@@ -917,42 +942,24 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
             {["monthly","weekly","annual"].map(fr => (
               <button key={fr} onClick={()=>set("frequency",fr)}
                 style={{flex:1,background:f.frequency===fr?"#c5f135":"#2c2c2e",color:f.frequency===fr?"#000":"#fff",
-                        border:"none",borderRadius:10,padding:"10px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textTransform:"capitalize"}}>
-                {fr}
-              </button>
+                        border:"none",borderRadius:10,padding:"10px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textTransform:"capitalize"}}>{fr}</button>
             ))}
           </div>
-
-          {f.frequency === "monthly" && (
-            <>
-              <Label>Day of month</Label>
-              <input className="in" type="number" min="1" max="31" value={f.dueDay} onChange={e=>set("dueDay",e.target.value)} />
-            </>
-          )}
-          {f.frequency === "weekly" && (
-            <>
-              <Label>Day of week</Label>
-              <div style={{display:"flex",gap:5,marginBottom:6}}>
-                {DOW.map((d,i)=>(
-                  <button key={d} onClick={()=>set("dueDay",i)}
-                    style={{flex:1,background:Number(f.dueDay)===i?"#c5f135":"#2c2c2e",color:Number(f.dueDay)===i?"#000":"#8e8e93",
-                            border:"none",borderRadius:8,padding:"9px 0",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
-                    {d[0]}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-          {f.frequency === "annual" && (
-            <>
-              <Label>Date (MM-DD)</Label>
-              <input className="in" value={f.annualDate} onChange={e=>set("annualDate",e.target.value)} placeholder="04-15" />
-            </>
-          )}
+          {f.frequency === "monthly" && (<><Label>Day of month</Label>
+            <input className="in" type="number" min="1" max="31" value={f.dueDay} onChange={e=>set("dueDay",e.target.value)} /></>)}
+          {f.frequency === "weekly" && (<><Label>Day of week</Label>
+            <div style={{display:"flex",gap:5,marginBottom:6}}>
+              {DOW.map((d,i)=>(
+                <button key={d} onClick={()=>set("dueDay",i)}
+                  style={{flex:1,background:Number(f.dueDay)===i?"#c5f135":"#2c2c2e",color:Number(f.dueDay)===i?"#000":"#8e8e93",
+                          border:"none",borderRadius:8,padding:"9px 0",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{d[0]}</button>
+              ))}
+            </div></>)}
+          {f.frequency === "annual" && (<><Label>Date (MM-DD)</Label>
+            <input className="in" value={f.annualDate} onChange={e=>set("annualDate",e.target.value)} placeholder="04-15" /></>)}
         </>
       )}
 
-      {/* THE SUGGESTION — live, as they type */}
       {preview && (
         <div style={{background:"#1a2408",border:"1px solid #c5f13544",borderRadius:12,padding:"13px 15px",margin:"14px 0 6px"}}>
           <div style={{fontSize:11,color:"#8e9e6a",letterSpacing:".4px",textTransform:"uppercase",marginBottom:3}}>Suggested {f.frequency} payment</div>
@@ -963,12 +970,10 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
         </div>
       )}
 
-      {/* Bill extras */}
       {bill && (
         <>
           <Label>Payment link <Dim>(optional)</Dim></Label>
           <input className="in" value={f.paymentUrl} onChange={e=>set("paymentUrl",e.target.value)} placeholder="https://..." />
-
           <div style={{background:"#2c2c2e",borderRadius:12,padding:"13px 15px",marginTop:12}}>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
               <div style={{flex:1,paddingRight:12}}>
@@ -989,9 +994,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
                   {[2,3,4,5,7].map(n=>(
                     <button key={n} onClick={()=>set("autopayLeadDays",n)}
                       style={{flex:1,background:Number(f.autopayLeadDays)===n?"#c5f135":"#3a3a3c",color:Number(f.autopayLeadDays)===n?"#000":"#fff",
-                              border:"none",borderRadius:8,padding:"9px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
-                      {n}
-                    </button>
+                              border:"none",borderRadius:8,padding:"9px 0",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{n}</button>
                   ))}
                 </div>
               </div>
@@ -1023,7 +1026,6 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-// ─── Envelope detail ─────────────────────────────────────────────────────────
 function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, onMarkPaid }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const locked = isLocked(env, transactions);
@@ -1115,15 +1117,11 @@ function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, 
       </div>
 
       {env.paymentUrl && !paid && (
-        <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-green" style={{display:"block",textAlign:"center",textDecoration:"none",marginBottom:8}}>
-          Go pay it ↗
-        </a>
+        <a href={env.paymentUrl} target="_blank" rel="noopener noreferrer" className="btn-green" style={{display:"block",textAlign:"center",textDecoration:"none",marginBottom:8}}>Go pay it ↗</a>
       )}
-
       {isBill(env.type) && !paid && (
         <button className="btn-dim" style={{marginBottom:8}} onClick={onMarkPaid}>Mark as paid</button>
       )}
-
       <button className="btn-dim" style={{marginBottom:8}} onClick={onFund} disabled={locked}>
         {locked ? "🔒 Funds locked" : "Fund / release money"}
       </button>
@@ -1157,13 +1155,11 @@ function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, 
   );
 }
 
-// ─── Fund / unfund ───────────────────────────────────────────────────────────
 function FundSheet({ env, sts, transactions, onFund, onUnfund, onClose }) {
   const [amt, setAmt] = useState("");
   if (!env) return null;
   const need = shortfall(env, transactions);
   const n = parseFloat(amt) || 0;
-
   return (
     <Sheet onClose={onClose} title={`Fund ${env.name}`}>
       <div style={{display:"flex",gap:10,marginBottom:16}}>
@@ -1176,22 +1172,18 @@ function FundSheet({ env, sts, transactions, onFund, onUnfund, onClose }) {
           <div style={{fontSize:19,fontWeight:700,letterSpacing:"-.6px"}}>{money(env.funded||0)}</div>
         </div>
       </div>
-
       {need > 0 && (
         <div style={{background:"#2a2408",border:"1px solid #ffd60a33",borderRadius:11,padding:"10px 13px",marginBottom:14,fontSize:12.5,color:"#ffd60a",lineHeight:1.45}}>
           Needs {money(need)} more to cover {money(targetAmount(env))}.
         </div>
       )}
-
       <Label>Amount</Label>
       <input className="in" type="number" value={amt} autoFocus onChange={e=>setAmt(e.target.value)} placeholder="0" />
-
       <div style={{display:"flex",gap:7,marginTop:9,marginBottom:16}}>
         {need>0 && <button className="chip" onClick={()=>setAmt(String(Math.min(need,sts)))}>Fill the gap</button>}
         <button className="chip" onClick={()=>setAmt(String(Math.max(0,Math.floor(sts/2))))}>Half of safe</button>
         {(env.funded||0)>0 && <button className="chip" onClick={()=>setAmt(String(env.funded))}>All of it</button>}
       </div>
-
       <button className="btn-green" onClick={()=>onFund(n)} disabled={n<=0||n>sts} style={{marginBottom:8,opacity:(n<=0||n>sts)?.4:1}}>
         Move {money(n)} in
       </button>
@@ -1204,7 +1196,6 @@ function FundSheet({ env, sts, transactions, onFund, onUnfund, onClose }) {
   );
 }
 
-// ─── Assign a transaction + teach the matcher ────────────────────────────────
 function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
   const [remember, setRemember] = useState(true);
   return (
@@ -1213,7 +1204,6 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
         <div style={{fontSize:15,fontWeight:600,marginBottom:3}}>{tx.desc}</div>
         <div style={{fontSize:13,color:"#8e8e93"}}>{money(tx.amount)} · {tx.date}</div>
       </div>
-
       <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:14}}>
         {envelopes.map(env=>(
           <button key={env.id} onClick={()=>onAssign(tx, env.id, remember)}
@@ -1227,7 +1217,6 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
           </button>
         ))}
       </div>
-
       <button onClick={()=>setRemember(!remember)}
         style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"12px 14px",width:"100%",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",marginBottom:10}}>
         <div style={{width:21,height:21,borderRadius:6,background:remember?"#c5f135":"#48484a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#000",flexShrink:0}}>
@@ -1238,13 +1227,11 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
           <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>Teach it once, never sort this bill again</div>
         </div>
       </button>
-
       <button className="btn-dim" onClick={onSkip} style={{color:"#8e8e93"}}>Skip — not a budget item</button>
     </Sheet>
   );
 }
 
-// ─── primitives ──────────────────────────────────────────────────────────────
 function Sheet({ children, onClose, title }) {
   return (
     <div className="overlay" onClick={onClose}>
@@ -1270,7 +1257,6 @@ const DRow = ({k,v,accent}) => (
   </div>
 );
 
-// ─── styles ──────────────────────────────────────────────────────────────────
 const S = {
   app: {fontFamily:"-apple-system,'SF Pro Display','SF Pro Text','Helvetica Neue',sans-serif",background:"#000",minHeight:"100vh",color:"#fff",maxWidth:430,margin:"0 auto",position:"relative",WebkitFontSmoothing:"antialiased"},
   page: {padding:"20px 22px 110px"},
@@ -1279,12 +1265,13 @@ const S = {
 const CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 ::-webkit-scrollbar{display:none}
-input::placeholder{color:#48484a}
+input::placeholder,textarea::placeholder{color:#48484a}
 input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.4)}
 button{-webkit-tap-highlight-color:transparent}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes sheetUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 .card{background:#1c1c1e;border-radius:18px;border:none;color:#fff;font-family:inherit}
 .env-card{padding:15px;text-align:left;cursor:pointer;width:100%;transition:opacity .12s}
