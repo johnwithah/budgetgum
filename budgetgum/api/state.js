@@ -27,6 +27,7 @@ const EMPTY = {
   accounts: [],
   unmapped: [],
   lastSync: null,
+  importSince: '2026-07-14',
   updatedAt: null,
 };
 
@@ -61,6 +62,7 @@ module.exports = async (req, res) => {
       accounts:     body.accounts     || [],
       unmapped:     body.unmapped     || [],
       lastSync:     body.lastSync     || null,
+      importSince:  body.importSince  || '2026-07-14',
       updatedAt:    Date.now(),
     };
 

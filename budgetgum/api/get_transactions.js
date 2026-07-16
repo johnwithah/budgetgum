@@ -1,13 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// get_transactions.js — pulls 30 days of transactions + balances.
+// get_transactions.js — pulls transactions + balances.
 //
-// THE OLD VERSION took an access_token from the request body. Whatever the client
-// sent, it used. That's backwards: it means the endpoint trusts the caller to
-// hand it the key.
+// The access token is read from Redis (via the session), never from the request
+// body — so the browser never holds the key to your bank data.
 //
-// THE NEW VERSION ignores the body entirely and looks the token up from Redis
-// using the session. An attacker can't inject a token, and there's nothing for
-// them to steal from the browser, because the browser doesn't have it.
+// NEW: the client may pass a `since` date (YYYY-MM-DD). We won't fetch anything
+// before it. This lets the app say "only import transactions from July 14 on,"
+// which keeps old history from backfilling into envelopes you just created.
+// `since` is the only thing we read from the body, and it's validated hard —
+// it can't be used to reach any data the session doesn't already own.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
@@ -25,12 +26,20 @@ const plaidClient = new PlaidApi(new Configuration({
   },
 }));
 
+// Accept only a clean YYYY-MM-DD string. Anything else → ignore it and fall back.
+function cleanDate(s) {
+  if (typeof s !== 'string') return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(s + 'T00:00:00');
+  if (isNaN(d.getTime())) return null;
+  return s;
+}
+
 module.exports = async (req, res) => {
   if (handlePreflight(req, res)) return;
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   if (!requireAuth(req, res)) return;
 
-  // Note: req.body is never read. The token comes from OUR storage, not theirs.
   let accessToken;
   try {
     accessToken = await kv.get(ACCESS_TOKEN_KEY);
@@ -38,35 +47,54 @@ module.exports = async (req, res) => {
     console.error('kv.get failed:', err.message);
     return res.status(500).json({ error: 'Storage unavailable' });
   }
-
   if (!accessToken) {
     return res.status(400).json({ error: 'No bank connected', code: 'NO_BANK' });
   }
 
   const today = new Date();
-  const startDate = new Date(today);
-  startDate.setDate(today.getDate() - 30);
+
+  // Default lookback: 30 days. If the client sends a valid `since`, use the
+  // later of (since) and (90 days ago) — we never pull more than 90 days,
+  // both to stay light and because Plaid's window has limits.
+  const ninetyAgo = new Date(today); ninetyAgo.setDate(today.getDate() - 90);
+  const thirtyAgo = new Date(today); thirtyAgo.setDate(today.getDate() - 30);
+
+  const since = cleanDate(req.body?.since);
+  let startDate;
+  if (since) {
+    const sinceDate = new Date(since + 'T00:00:00');
+    startDate = sinceDate > ninetyAgo ? sinceDate : ninetyAgo;
+  } else {
+    startDate = thirtyAgo;
+  }
+
+  const startStr = startDate.toISOString().split('T')[0];
+  const endStr = today.toISOString().split('T')[0];
 
   try {
     const [txRes, balRes] = await Promise.all([
       plaidClient.transactionsGet({
         access_token: accessToken,
-        start_date: startDate.toISOString().split('T')[0],
-        end_date: today.toISOString().split('T')[0],
+        start_date: startStr,
+        end_date: endStr,
         options: { count: 100 },
       }),
       plaidClient.accountsBalanceGet({ access_token: accessToken }),
     ]);
 
-    const transactions = txRes.data.transactions.map(t => ({
-      id: t.transaction_id,
-      desc: t.merchant_name || t.name,
-      amount: Math.abs(t.amount),
-      date: t.date,
-      category: t.personal_finance_category?.primary || t.category?.[0] || 'Other',
-      pending: t.pending,
-      type: 'bank',
-    }));
+    // Backstop filter: even if Plaid returns an edge-case earlier date, drop
+    // anything before the cutoff so nothing sneaks in behind your envelopes.
+    const transactions = txRes.data.transactions
+      .filter(t => t.date >= startStr)
+      .map(t => ({
+        id: t.transaction_id,
+        desc: t.merchant_name || t.name,
+        amount: Math.abs(t.amount),
+        date: t.date,
+        category: t.personal_finance_category?.primary || t.category?.[0] || 'Other',
+        pending: t.pending,
+        type: 'bank',
+      }));
 
     const accounts = balRes.data.accounts.map(a => ({
       id: a.account_id,
@@ -78,26 +106,17 @@ module.exports = async (req, res) => {
       mask: a.mask,
     }));
 
-    // Cache accounts so the dashboard can show balances without re-hitting Plaid.
-    // Relevant on the free tier, where API calls are metered.
-    try {
-      await kv.set(ACCOUNTS_KEY, accounts);
-    } catch { /* non-fatal — caching is a nice-to-have */ }
+    try { await kv.set(ACCOUNTS_KEY, accounts); } catch {}
 
-    res.status(200).json({ transactions, accounts });
+    res.status(200).json({ transactions, accounts, since: startStr });
   } catch (err) {
     const detail = err.response?.data || { message: err.message };
     console.error('get_transactions error:', JSON.stringify(detail));
-
-    // ITEM_LOGIN_REQUIRED means your bank credentials changed or MFA expired —
-    // the stored token is dead and you need to re-link. Worth flagging distinctly
-    // so the UI can prompt you instead of showing a generic failure.
     const plaidCode = detail?.error_code;
     if (plaidCode === 'ITEM_LOGIN_REQUIRED') {
       await kv.del(ACCESS_TOKEN_KEY).catch(() => {});
       return res.status(400).json({ error: 'Bank needs re-linking', code: 'RELINK' });
     }
-
     res.status(500).json({ error: 'Failed to fetch data', plaid: detail });
   }
 };
