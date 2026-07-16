@@ -40,6 +40,7 @@ export const EMPTY_STATE = {
   accounts: [],
   unmapped: [],
   lastSync: null,
+  importSince: "2026-07-14",   // only import bank transactions on/after this date
 };
 
 function readCache() {

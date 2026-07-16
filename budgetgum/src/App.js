@@ -159,7 +159,10 @@ export default function App() {
   const syncBank = useCallback(async () => {
     setSyncing(true);
     try {
-      const r = await api("/api/get_transactions");
+      // Only import transactions on/after this date, so old history doesn't
+      // backfill into envelopes you just created. Defaults to July 14, 2026.
+      const since = state.importSince || "2026-07-14";
+      const r = await api("/api/get_transactions", { since });
       if (r.status === 401) { setAuthState("locked"); setSyncing(false); return; }
       const d = await r.json();
       if (!r.ok) {
@@ -170,7 +173,9 @@ export default function App() {
       }
 
       const seen = new Set(transactions.map(t => t.id));
-      const fresh = (d.transactions || []).filter(t => !seen.has(t.id) && !t.pending);
+      const fresh = (d.transactions || [])
+        .filter(t => !seen.has(t.id) && !t.pending)
+        .filter(t => t.date >= since);   // backstop: never import before the cutoff
       const matched = [], needsAssign = [];
       fresh.forEach(t => {
         const envId = matchEnvelope(t, envelopes);
@@ -194,7 +199,7 @@ export default function App() {
     } catch { showToast("Sync failed"); }
     setSyncing(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transactions, envelopes, setState]);
+  }, [transactions, envelopes, setState, state.importSince]);
 
   // ── The release mechanic ──────────────────────────────────────────────────
   function applyPayments(env, payments) {
@@ -597,6 +602,12 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
     onClose();
   }
 
+  const importSince = state.importSince || "2026-07-14";
+  function setImportSince(v) {
+    saveNow({ ...state, importSince: v });
+    onToast("Import date updated");
+  }
+
   return (
     <Sheet onClose={onClose} title="Settings">
       <div className="grp" style={{marginBottom:14}}>
@@ -614,6 +625,16 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
           <span style={{fontSize:14.5,color:"#8e8e93"}}>Transactions</span>
           <span style={{fontSize:14.5,fontWeight:600}}>{state.transactions.length}</span>
         </div>
+      </div>
+
+      {/* Import cutoff — only pull transactions on/after this date */}
+      <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
+        <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>Import transactions from</div>
+        <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+          Bank syncs skip anything before this date, so old history won't land in envelopes you just made.
+        </div>
+        <input className="in" type="date" value={importSince}
+          onChange={e=>setImportSince(e.target.value)} />
       </div>
 
       <div style={{fontSize:12,color:"#636366",lineHeight:1.55,marginBottom:14,padding:"0 2px"}}>
