@@ -608,6 +608,23 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
     onToast("Import date updated");
   }
 
+  // Empty the whole sort queue — the unassigned transactions waiting to be
+  // filed. This doesn't touch already-sorted transactions or envelope balances;
+  // it just discards the backlog of things you never assigned.
+  function clearQueue() {
+    saveNow({ ...state, unmapped: [] });
+    onToast("Sort queue cleared");
+  }
+
+  // Drop only the queue items dated before the import cutoff — keeps anything
+  // legitimately recent, clears the old backfill.
+  function clearOldQueue() {
+    const kept = (state.unmapped || []).filter(t => t.date >= importSince);
+    const removed = (state.unmapped || []).length - kept.length;
+    saveNow({ ...state, unmapped: kept });
+    onToast(`Cleared ${removed} old — ${kept.length} kept`);
+  }
+
   return (
     <Sheet onClose={onClose} title="Settings">
       <div className="grp" style={{marginBottom:14}}>
@@ -636,6 +653,25 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
         <input className="in" type="date" value={importSince}
           onChange={e=>setImportSince(e.target.value)} />
       </div>
+
+      {/* Sort queue cleanup */}
+      {(state.unmapped || []).length > 0 && (
+        <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
+          <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>
+            Sort queue · {(state.unmapped || []).length}
+          </div>
+          <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+            Unassigned transactions waiting to be filed. Clearing them doesn't affect
+            envelope balances or anything you've already sorted.
+          </div>
+          <button className="btn-dim" style={{marginBottom:8}} onClick={clearOldQueue}>
+            Clear ones before {importSince}
+          </button>
+          <button className="btn-dim" style={{color:"#ff375f"}} onClick={clearQueue}>
+            Clear all {(state.unmapped || []).length}
+          </button>
+        </div>
+      )}
 
       <div style={{fontSize:12,color:"#636366",lineHeight:1.55,marginBottom:14,padding:"0 2px"}}>
         Your budget is stored on the server and syncs across every device you sign into.
