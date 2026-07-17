@@ -39,6 +39,7 @@ export const EMPTY_STATE = {
   transactions: [],
   accounts: [],
   unmapped: [],
+  ignored: [],                 // ids of deleted transactions — never re-import
   lastSync: null,
   importSince: "2026-07-14",   // only import bank transactions on/after this date
 };

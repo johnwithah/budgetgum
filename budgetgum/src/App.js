@@ -108,6 +108,7 @@ export default function App() {
   const [detailEnv, setDetailEnv] = useState(null);
   const [fundEnv, setFundEnv] = useState(null);
   const [mapTx, setMapTx] = useState(null);
+  const [txDetail, setTxDetail] = useState(null);   // a sorted transaction being viewed/edited
   const [settings, setSettings] = useState(false);
 
   const checkingBalance = useMemo(
@@ -173,21 +174,32 @@ export default function App() {
       }
 
       const seen = new Set(transactions.map(t => t.id));
+      const ignored = new Set(state.ignored || []);
       const fresh = (d.transactions || [])
         .filter(t => !seen.has(t.id) && !t.pending)
-        .filter(t => t.date >= since);   // backstop: never import before the cutoff
-      const matched = [], needsAssign = [];
+        .filter(t => !ignored.has(t.id))   // deleted transactions never come back
+        .filter(t => t.date >= since);     // backstop: never import before the cutoff
+
+      const matched = [], needsAssign = [], deposits = [];
       fresh.forEach(t => {
+        // Inflows (deposits, refunds — amount <= 0) are recorded but never
+        // queued for sorting and never touch envelopes. Checking balance
+        // already reflects them.
+        if (t.amount <= 0) { deposits.push({ ...t, envelopeId: null, kind: "deposit" }); return; }
         const envId = matchEnvelope(t, envelopes);
         if (envId) matched.push({ ...t, envelopeId: envId });
         else needsAssign.push(t);
       });
 
+      // Recorded immediately: matched outflows + deposits. Only unmatched
+      // outflows go to the sort queue.
+      const recorded = [...matched, ...deposits];
+
       // One atomic state update — keeps the server write consistent.
       setState(s => ({
         ...s,
         accounts: d.accounts || [],
-        transactions: matched.length ? [...matched, ...s.transactions] : s.transactions,
+        transactions: recorded.length ? [...recorded, ...s.transactions] : s.transactions,
         envelopes: matched.length
           ? s.envelopes.map(env => applyPayments(env, matched.filter(t => t.envelopeId === env.id)))
           : s.envelopes,
@@ -195,22 +207,94 @@ export default function App() {
         lastSync: new Date().toISOString(),
       }));
 
-      showToast(`Synced — ${fresh.length} new`);
+      const inflowNote = deposits.length ? `, ${deposits.length} deposit${deposits.length>1?"s":""}` : "";
+      showToast(`Synced — ${fresh.length} new${inflowNote}`);
     } catch { showToast("Sync failed"); }
     setSyncing(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transactions, envelopes, setState, state.importSince]);
+  }, [transactions, envelopes, setState, state.importSince, state.ignored]);
 
   // ── The release mechanic ──────────────────────────────────────────────────
+  // Applying a payment to an envelope: a debt balance drops, a goal grows, and
+  // for a bill the funded amount settles to 0 (unused reservation released).
+  //
+  // Only OUTFLOWS (money leaving, amount > 0) act on envelopes. Deposits are
+  // recorded but never applied — the checking balance already reflects them.
   function applyPayments(env, payments) {
-    if (!payments.length) return env;
-    const total = payments.reduce((s,t) => s + t.amount, 0);
+    const outflows = payments.filter(t => t.amount > 0);
+    if (!outflows.length) return env;
+    const total = outflows.reduce((s,t) => s + t.amount, 0);
     let next = { ...env };
     if (env.type === TYPES.DEBT)      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
     else if (env.type === TYPES.GOAL) next.currentBalance = (env.currentBalance || 0) + total;
     if (isBill(env.type)) next.funded = 0;
     else next.funded = Math.max(0, (env.funded || 0) - total);
     return next;
+  }
+
+  // ── The MIRROR of applyPayments ────────────────────────────────────────────
+  // Undoing a payment has to reverse exactly what applying it did, or balances
+  // drift silently. A debt balance goes back UP, a goal comes back DOWN. The
+  // funded/paid side is trickier: settling a bill zeroed `funded` and left no
+  // record of what it was, so we can't perfectly restore the old reservation.
+  // Reversing the balance is the part that must be right (it's what corrupts
+  // your payoff math); the funded reset is cosmetic and self-heals next period.
+  function unapplyPayments(env, payments) {
+    const outflows = payments.filter(t => t.amount > 0);
+    if (!outflows.length) return env;
+    const total = outflows.reduce((s,t) => s + t.amount, 0);
+    let next = { ...env };
+    if (env.type === TYPES.DEBT)      next.currentBalance = (env.currentBalance || 0) + total;
+    else if (env.type === TYPES.GOAL) next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
+    // Clear any manual "paid" override for this period — removing the payment
+    // means it may no longer be paid, and isPaid() will recompute from what's left.
+    if (isBill(env.type)) next.manualPaidPeriod = null;
+    return next;
+  }
+
+  // Move a sorted transaction to a different envelope: reverse it off the old
+  // one, apply it to the new one, relabel it.
+  function moveTransaction(tx, newEnvId) {
+    if (tx.envelopeId === newEnvId) { setTxDetail(null); return; }
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.map(t => t.id === tx.id ? { ...t, envelopeId: newEnvId } : t),
+      envelopes: s.envelopes.map(e => {
+        if (e.id === tx.envelopeId) return unapplyPayments(e, [tx]);
+        if (e.id === newEnvId)      return applyPayments(e, [{ ...tx, envelopeId: newEnvId }]);
+        return e;
+      }),
+    }));
+    setTxDetail(null);
+    showToast("Moved");
+  }
+
+  // Re-queue: reverse effects, pull it out of sorted, drop it back in the queue
+  // to be sorted again.
+  function requeueTransaction(tx) {
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.filter(t => t.id !== tx.id),
+      unmapped: [{ ...tx, envelopeId: null }, ...s.unmapped],
+      envelopes: s.envelopes.map(e => e.id === tx.envelopeId ? unapplyPayments(e, [tx]) : e),
+    }));
+    setTxDetail(null);
+    showToast("Sent back to sort queue");
+  }
+
+  // Delete: reverse effects, remove it, and remember its id so the next bank
+  // sync won't re-import it. (It's still in your real bank feed, so without the
+  // ignore-list it would silently come back.)
+  function deleteTransaction(tx) {
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.filter(t => t.id !== tx.id),
+      unmapped: s.unmapped.filter(t => t.id !== tx.id),
+      ignored: [...(s.ignored || []), tx.id],
+      envelopes: s.envelopes.map(e => e.id === tx.envelopeId ? unapplyPayments(e, [tx]) : e),
+    }));
+    setTxDetail(null);
+    showToast("Deleted — won't return on sync");
   }
 
   function fund(envId, amount) {
@@ -336,7 +420,7 @@ export default function App() {
         )}
 
         <div className="tabs">
-          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
             <button key={t} onClick={()=>setTab(t)} className={`tab ${tab===t?"on":""}`}>
               <span style={{fontSize:18}}>{ic}</span>{l}
             </button>
@@ -461,10 +545,38 @@ export default function App() {
                     onOpen={()=>setDetailEnv(env)} onMarkPaid={()=>markPaid(env)} />)}
             </div>
           )}
+        </div>
+      )}
 
-          {debts.length > 0 && (
+      {/* ═══ DEBT PAYOFF ═══ */}
+      {tab === "debt" && (
+        <div style={S.page}>
+          <div className="sec">Debt Payoff</div>
+          {debts.length === 0 ? (
+            <div className="card" style={{padding:28,textAlign:"center"}}>
+              <div style={{fontSize:36,marginBottom:10}}>◐</div>
+              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No debts tracked</div>
+              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                Add a Debt envelope to watch a credit card or loan drop toward zero — with a
+                suggested payment and a warning if a 0% period is running out.
+              </div>
+              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.DEBT})}>Track a Debt</button>
+            </div>
+          ) : (
             <>
-              <div className="sec" style={{marginTop:26}}>Debt Payoff</div>
+              {/* Quick totals across every debt */}
+              <div className="card" style={{padding:"16px 18px",marginBottom:16,display:"flex"}}>
+                {[
+                  ["Total owed", money(debts.reduce((s,e)=>s+(e.currentBalance||0),0)), "#fff"],
+                  ["Paid off", money(debts.reduce((s,e)=>s+Math.max(0,(e.originalBalance||0)-(e.currentBalance||0)),0)), "#30d158"],
+                  ["Suggested/mo", money(debts.reduce((s,e)=>s+suggestedPayment(e),0)), "#c5f135"],
+                ].map(([label,val,color],i)=>(
+                  <div key={i} style={{flex:1,textAlign:i===0?"left":i===1?"center":"right"}}>
+                    <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:500,marginBottom:4}}>{label}</div>
+                    <div style={{fontSize:18,fontWeight:700,letterSpacing:"-.8px",color}}>{val}</div>
+                  </div>
+                ))}
+              </div>
               <div style={{display:"flex",flexDirection:"column",gap:10}}>
                 {debts.map(env => <DebtCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
               </div>
@@ -486,17 +598,21 @@ export default function App() {
             </div>
           ) : (
             <div className="grp">
-              {transactions.slice(0,60).map(tx => {
+              {transactions.slice(0,80).map(tx => {
                 const env = envelopes.find(e => e.id === tx.envelopeId);
+                const isDeposit = tx.amount <= 0 || tx.kind === "deposit";
                 return (
-                  <div key={tx.id} className="row">
-                    <div className="ibox" style={{background:env?env.color+"22":"#2c2c2e"}}>{env?.icon||"💸"}</div>
+                  <button key={tx.id} className="row row-tap" style={{width:"100%",textAlign:"left",background:"none",border:"none",fontFamily:"inherit",color:"#fff"}}
+                    onClick={()=>setTxDetail(tx)}>
+                    <div className="ibox" style={{background:isDeposit?"#30d15822":env?env.color+"22":"#2c2c2e"}}>{isDeposit?"⬇":env?.icon||"💸"}</div>
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:15,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tx.desc}</div>
-                      <div style={{fontSize:12,color:"#636366",marginTop:1}}>{env?.name||"Unassigned"} · {tx.date}</div>
+                      <div style={{fontSize:12,color:"#636366",marginTop:1}}>{isDeposit?"Deposit":env?.name||"Unassigned"} · {tx.date}</div>
                     </div>
-                    <div style={{fontSize:15,fontWeight:600,color:"#aeaeb2"}}>−{money(tx.amount)}</div>
-                  </div>
+                    <div style={{fontSize:15,fontWeight:600,color:isDeposit?"#30d158":"#aeaeb2"}}>
+                      {isDeposit?`+${money(Math.abs(tx.amount))}`:`−${money(tx.amount)}`}
+                    </div>
+                  </button>
                 );
               })}
             </div>
@@ -505,7 +621,7 @@ export default function App() {
       )}
 
       <div className="tabbar">
-        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
           <button key={t} onClick={()=>setTab(t)} className={`tb ${tab===t?"on":""}`}>
             <span style={{fontSize:21}}>{ic}</span>{l}
           </button>
@@ -533,7 +649,88 @@ export default function App() {
                       onAssign={assignTx}
                       onSkip={()=>{ setUnmapped(p=>p.filter(t=>t.id!==mapTx.id)); setMapTx(null); }}
                       onClose={()=>setMapTx(null)} />}
+      {txDetail  && <TransactionDetail tx={txDetail} envelopes={envelopes}
+                      onMove={moveTransaction}
+                      onRequeue={requeueTransaction}
+                      onDelete={deleteTransaction}
+                      onClose={()=>setTxDetail(null)} />}
     </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
+// ═════════════════════════════════════════════════════════════════════════════
+function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onClose }) {
+  const [moving, setMoving] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const env = envelopes.find(e => e.id === tx.envelopeId);
+  const isDeposit = tx.amount <= 0 || tx.kind === "deposit";
+
+  return (
+    <Sheet onClose={onClose} title={null}>
+      <div style={{textAlign:"center",marginBottom:20}}>
+        <div style={{fontSize:44,marginBottom:10}}>{isDeposit?"⬇":env?.icon||"💸"}</div>
+        <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>{tx.desc}</div>
+        <div style={{fontSize:26,fontWeight:700,letterSpacing:"-1px",marginTop:6,color:isDeposit?"#30d158":"#fff"}}>
+          {isDeposit?`+${money(Math.abs(tx.amount))}`:`−${money(tx.amount)}`}
+        </div>
+        <div style={{fontSize:13,color:"#8e8e93",marginTop:6}}>
+          {tx.date}{tx.type==="bank"?" · from bank":""}
+        </div>
+        {!isDeposit && (
+          <div style={{display:"inline-block",marginTop:10,background:env?env.color+"22":"#2c2c2e",color:env?env.color:"#8e8e93",borderRadius:20,padding:"5px 14px",fontSize:13,fontWeight:600}}>
+            {env ? `${env.icon} ${env.name}` : "Unassigned"}
+          </div>
+        )}
+      </div>
+
+      {isDeposit ? (
+        <div className="card" style={{padding:16,marginBottom:8,fontSize:13,color:"#8e8e93",lineHeight:1.55,textAlign:"center"}}>
+          This is money coming in. It's already reflected in your checking balance, so it isn't
+          sorted into an envelope. You can still delete it from your history.
+        </div>
+      ) : !moving ? (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>Move to another envelope</button>
+      ) : (
+        <div className="card" style={{padding:14,marginBottom:8}}>
+          <div style={{fontSize:13,color:"#8e8e93",marginBottom:10}}>Move to…</div>
+          <div style={{display:"flex",flexDirection:"column",gap:7}}>
+            {envelopes.filter(e => e.id !== tx.envelopeId).map(e => (
+              <button key={e.id} onClick={()=>onMove(tx, e.id)}
+                style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"11px 14px",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",color:"#fff"}}>
+                <span style={{fontSize:20}}>{e.icon}</span>
+                <div style={{flex:1,textAlign:"left"}}>
+                  <div style={{fontSize:15,fontWeight:500}}>{e.name}</div>
+                  <div style={{fontSize:12,color:"#8e8e93"}}>{TYPE_META[e.type].label}</div>
+                </div>
+                <span style={{color:"#48484a",fontSize:17}}>›</span>
+              </button>
+            ))}
+          </div>
+          <button className="btn-dim" style={{marginTop:10}} onClick={()=>setMoving(false)}>Cancel</button>
+        </div>
+      )}
+
+      {!isDeposit && (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={()=>onRequeue(tx)}>
+          Send back to sort queue
+        </button>
+      )}
+
+      {!confirmDel ? (
+        <button className="btn-dim" style={{color:"#ff375f"}} onClick={()=>setConfirmDel(true)}>Delete transaction</button>
+      ) : (
+        <div>
+          <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,margin:"4px 2px 8px",textAlign:"center"}}>
+            Reverses its effect on any envelope and stops it returning on the next sync.
+          </div>
+          <button className="btn-dim" style={{background:"#ff375f",color:"#fff"}} onClick={()=>onDelete(tx)}>
+            Really delete?
+          </button>
+        </div>
+      )}
+    </Sheet>
   );
 }
 
@@ -1333,6 +1530,8 @@ button{-webkit-tap-highlight-color:transparent}
 .card{background:#1c1c1e;border-radius:18px;border:none;color:#fff;font-family:inherit}
 .env-card{padding:15px;text-align:left;cursor:pointer;width:100%;transition:opacity .12s}
 .env-card:active{opacity:.6}
+.row-tap{transition:background .12s}
+.row-tap:active{background:rgba(255,255,255,.04)}
 .grp{background:#1c1c1e;border-radius:15px;overflow:hidden}
 .row{padding:13px 15px;display:flex;align-items:center;gap:11px}
 .row+.row{border-top:.5px solid rgba(255,255,255,.08)}
@@ -1346,11 +1545,11 @@ button{-webkit-tap-highlight-color:transparent}
 .tiny-link{background:none;border:none;color:#48484a;font-size:11px;cursor:pointer;font-family:inherit;padding:0;text-decoration:underline}
 
 .tabs{display:flex;border-bottom:.5px solid rgba(255,255,255,.1);margin-top:18px}
-.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:10px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9px;font-weight:500;letter-spacing:.2px;text-transform:uppercase;font-family:inherit;transition:color .15s}
 .tab.on{color:#c5f135;border-bottom-color:#c5f135}
 
 .tabbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:rgba(0,0,0,.85);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-top:.5px solid rgba(255,255,255,.1);display:flex;padding:10px 0 28px;z-index:40}
-.tb{flex:1;background:none;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9.5px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tb{flex:1;background:none;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9px;font-weight:500;letter-spacing:.2px;text-transform:uppercase;font-family:inherit;transition:color .15s}
 .tb.on{color:#c5f135}
 
 .btn-green{background:#c5f135;color:#000;border:none;border-radius:13px;font-family:inherit;font-size:16px;font-weight:600;letter-spacing:-.3px;padding:15px;cursor:pointer;width:100%;transition:opacity .12s}

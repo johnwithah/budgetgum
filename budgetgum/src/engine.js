@@ -124,6 +124,7 @@ export function paidThisPeriod(env, transactions) {
   const end = nextDueDate(env);
   return transactions
     .filter(t => t.envelopeId === env.id)
+    .filter(t => t.amount > 0)   // outflows only; ignore refunds/inflows
     .filter(t => {
       const d = startOfDay(new Date(t.date + "T00:00:00"));
       return d >= start && d < end;
@@ -152,6 +153,7 @@ export function spentThisMonth(env, transactions) {
   const m = now.getMonth(), y = now.getFullYear();
   return transactions
     .filter(t => t.envelopeId === env.id)
+    .filter(t => t.amount > 0)   // outflows only; a refund shouldn't inflate spending
     .filter(t => {
       const d = new Date(t.date + "T00:00:00");
       return d.getMonth() === m && d.getFullYear() === y;
