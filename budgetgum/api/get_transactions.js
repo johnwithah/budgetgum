@@ -89,7 +89,11 @@ module.exports = async (req, res) => {
       .map(t => ({
         id: t.transaction_id,
         desc: t.merchant_name || t.name,
-        amount: Math.abs(t.amount),
+        // Preserve Plaid's sign convention: POSITIVE = money leaving (a debit/
+        // purchase), NEGATIVE = money coming in (a deposit/credit). The app keys
+        // off this: amount > 0 acts on envelopes, amount <= 0 is an inflow that's
+        // only recorded. Don't Math.abs() this — it destroys the distinction.
+        amount: t.amount,
         date: t.date,
         category: t.personal_finance_category?.primary || t.category?.[0] || 'Other',
         pending: t.pending,
