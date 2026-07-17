@@ -123,6 +123,28 @@ export default function App() {
   const bills  = envelopes.filter(e => isBill(e.type));
   const debts  = envelopes.filter(e => e.type === TYPES.DEBT);
 
+  // ── Home is a "where should my money go?" screen ──────────────────────────
+  // Spending envelopes (the discretionary ones) go up top; then the bills that
+  // are actually asking for money right now: due within 14 days AND not yet
+  // fully funded. Fully-funded or far-off bills drop off Home (handled) but
+  // still live in the Bills tab.
+  const spendingEnvelopes = useMemo(
+    () => envelopes.filter(e => e.type === TYPES.SPENDING),
+    [envelopes]
+  );
+  const upcomingUnfundedBills = useMemo(() => {
+    return envelopes
+      .filter(e => isBill(e.type))
+      .filter(e => !isPaid(e, transactions))
+      .filter(e => shortfall(e, transactions) > 0)   // not fully funded
+      .map(e => {
+        const due = nextDueDate(e);
+        return { env: e, due, days: due ? daysBetween(new Date(), due) : 999 };
+      })
+      .filter(x => x.days <= 14)
+      .sort((a, b) => a.days - b.days);
+  }, [envelopes, transactions]);
+
   function showToast(m) { setToast(m); setTimeout(()=>setToast(null), 3200); }
 
   const checkSession = useCallback(async () => {
@@ -495,12 +517,71 @@ export default function App() {
             <EmptyState onAdd={()=>setEditEnv({})} />
           ) : (
             <>
-              <div className="sec">Envelopes</div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11,marginBottom:22}}>
-                {envelopes.map(env => (
-                  <EnvCard key={env.id} env={env} transactions={transactions} onClick={()=>setDetailEnv(env)} />
-                ))}
-              </div>
+              {/* Spending — the discretionary envelopes competing for Safe to Spend */}
+              {spendingEnvelopes.length > 0 && (
+                <>
+                  <div className="sec">Spending</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:11,marginBottom:22}}>
+                    {spendingEnvelopes.map(env => (
+                      <EnvCard key={env.id} env={env} transactions={transactions} onClick={()=>setDetailEnv(env)} />
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {/* Coming due — bills within 14 days that still need funding.
+                  This is the actual decision: fund these, or keep it spendable? */}
+              {upcomingUnfundedBills.length > 0 && (
+                <>
+                  <div className="sec">Needs Funding · Next 14 Days</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:9,marginBottom:22}}>
+                    {upcomingUnfundedBills.map(({env,due,days}) => {
+                      const need = shortfall(env, transactions);
+                      const urg = days<=2?"#ff375f":days<=5?"#ffd60a":"#30d158";
+                      const canCover = sts >= need;
+                      return (
+                        <div key={env.id} className="card" style={{padding:14}}>
+                          <div style={{display:"flex",alignItems:"center",gap:11}}>
+                            <div className="ibox" style={{background:urg+"22"}}>{env.icon}</div>
+                            <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={()=>setDetailEnv(env)}>
+                              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                <span style={{fontSize:15,fontWeight:600,letterSpacing:"-.3px"}}>{env.name}</span>
+                                {env.autopay && <span style={{fontSize:11}}>🔒</span>}
+                              </div>
+                              <div style={{fontSize:12,color:urg,fontWeight:500,marginTop:2}}>
+                                {days===0?"Due today":days===1?"Due tomorrow":`Due in ${days} days`}
+                                {due?` · ${due.toLocaleDateString("en-US",{month:"short",day:"numeric"})}`:""}
+                              </div>
+                            </div>
+                            <div style={{textAlign:"right"}}>
+                              <div style={{fontSize:15,fontWeight:700,letterSpacing:"-.4px"}}>{money(need)}</div>
+                              <div style={{fontSize:10.5,color:"#8e8e93"}}>to fund</div>
+                            </div>
+                          </div>
+                          <div style={{display:"flex",gap:7,marginTop:11}}>
+                            <button className="btn-mini" style={{background:canCover?"#c5f135":"#2c2c2e",color:canCover?"#000":"#8e8e93"}}
+                              onClick={()=>setFundEnv(env)}>
+                              {canCover ? `Fund ${money(need)}` : "Fund partially"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              {spendingEnvelopes.length === 0 && upcomingUnfundedBills.length === 0 && (
+                <div className="card" style={{padding:"22px 20px",textAlign:"center",marginBottom:16}}>
+                  <div style={{fontSize:30,marginBottom:8}}>✓</div>
+                  <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>All caught up</div>
+                  <div style={{fontSize:13,color:"#636366",lineHeight:1.5}}>
+                    No spending envelopes, and nothing due in the next 14 days needs funding.
+                    Check the Bills or Debt tabs for the full picture.
+                  </div>
+                </div>
+              )}
+
               <button className="btn-dim" onClick={()=>setEditEnv({})}>+ New Envelope</button>
             </>
           )}
