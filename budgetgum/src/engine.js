@@ -134,9 +134,15 @@ export function paidThisPeriod(env, transactions) {
 
 // Paid = any payment landed this period, OR you manually marked it.
 // (Manual override exists for checks, cash, or when Plaid is slow.)
+//
+// Manual confirmations are stored per-period in `manualPaidPeriods` (an array of
+// due-date keys). We also honor the legacy single `manualPaidPeriod` field so
+// envelopes created before the archive existed still read correctly.
 export function isPaid(env, transactions) {
   if (!isBill(env.type)) return false;
-  if (env.manualPaidPeriod === periodKey(env)) return true;
+  const key = periodKey(env);
+  if ((env.manualPaidPeriods || []).includes(key)) return true;
+  if (env.manualPaidPeriod === key) return true;   // legacy
   return paidThisPeriod(env, transactions) > 0;
 }
 
@@ -145,6 +151,83 @@ export function isPaid(env, transactions) {
 export function periodKey(env) {
   const next = nextDueDate(env);
   return next ? next.toISOString().split("T")[0] : "";
+}
+
+// Step a due date back exactly one period. Used to walk history backwards.
+export function prevDueDate(env, due) {
+  const d = new Date(due);
+  if (env.frequency === "weekly")      d.setDate(d.getDate() - 7);
+  else if (env.frequency === "annual") d.setFullYear(d.getFullYear() - 1);
+  else {
+    // monthly — clamp so e.g. the 31st becomes the last valid day of the month
+    const targetMonth = d.getMonth() - 1;
+    const y = d.getFullYear();
+    const last = new Date(y, targetMonth + 1, 0).getDate();
+    return startOfDay(new Date(y, targetMonth, Math.min(env.dueDay || d.getDate(), last)));
+  }
+  return startOfDay(d);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE ARCHIVE — frozen, per-period payment history
+//
+// The anti-anxiety feature. For each past (and current) billing period we ask
+// one question of the real transaction record: was this satisfied, and with
+// what? Because it's derived from the actual cleared transaction, the answer is
+// permanent — the transaction IS the proof. Once "July: paid $127.40" is true,
+// it stays true, because that payment doesn't move.
+//
+// Returns most-recent-first: [{ key, dueDate, label, paid, amount, paidDate,
+// manual, missed }]. `missed` = a past period with no payment and no manual
+// confirmation — the one state that deserves attention.
+// ═════════════════════════════════════════════════════════════════════════════
+export function paymentHistory(env, transactions, count = 6) {
+  if (!isBill(env.type)) return [];
+  const today = startOfDay();
+  const manualSet = new Set([
+    ...(env.manualPaidPeriods || []),
+    ...(env.manualPaidPeriod ? [env.manualPaidPeriod] : []),   // legacy
+  ]);
+
+  const out = [];
+  let due = nextDueDate(env);
+  for (let i = 0; i < count && due; i++) {
+    const windowStart = prevDueDate(env, due);
+    const windowEnd = due;
+    const key = due.toISOString().split("T")[0];
+
+    const inWindow = transactions
+      .filter(t => t.envelopeId === env.id && t.amount > 0)
+      .filter(t => {
+        const d = startOfDay(new Date(t.date + "T00:00:00"));
+        return d >= windowStart && d < windowEnd;
+      });
+
+    const amount = inWindow.reduce((s, t) => s + t.amount, 0);
+    const paidDate = inWindow.length
+      ? inWindow.map(t => t.date).sort().slice(-1)[0]
+      : null;
+
+    const manual = manualSet.has(key);
+    const paid = amount > 0 || manual;
+    const isPast = windowEnd <= today;   // due date has passed
+
+    out.push({
+      key,
+      dueDate: due,
+      label: due.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
+      shortLabel: due.toLocaleDateString("en-US", { month: "short" }),
+      paid,
+      amount,
+      paidDate,
+      manual,
+      missed: isPast && !paid,
+      upcoming: !isPast,
+    });
+
+    due = prevDueDate(env, due);
+  }
+  return out;
 }
 
 // ── Spending envelopes: how much of this month's budget is gone? ─────────────

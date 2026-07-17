@@ -3,7 +3,7 @@ import { usePlaidLink } from "react-plaid-link";
 import { useCloudState, EMPTY_STATE } from "./useCloudState";
 import {
   TYPES, TYPE_META, isBill, hasTarget,
-  nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey,
+  nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
   safeToSpend, shortfall, upcomingLocks, buildAlerts,
   matchEnvelope, normalizeMerchant,
@@ -385,8 +385,37 @@ export default function App() {
   }
 
   function markPaid(env) {
-    setEnvelopes(p => p.map(e => e.id === env.id ? { ...e, manualPaidPeriod: periodKey(env), funded: 0 } : e));
+    const key = periodKey(env);
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const list = new Set([...(e.manualPaidPeriods || []), ...(e.manualPaidPeriod ? [e.manualPaidPeriod] : [])]);
+      list.add(key);
+      return { ...e, manualPaidPeriods: [...list], manualPaidPeriod: undefined, funded: 0 };
+    }));
     showToast("Marked as paid");
+  }
+
+  // Escape hatch: undo a manual "paid" mark for a given period. Only affects the
+  // manual flag — a real cleared transaction still counts as paid on its own.
+  function unmarkPaid(env, key) {
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const list = (e.manualPaidPeriods || []).filter(k => k !== key);
+      const legacy = e.manualPaidPeriod === key ? undefined : e.manualPaidPeriod;
+      return { ...e, manualPaidPeriods: list, manualPaidPeriod: legacy };
+    }));
+    showToast("Unmarked");
+  }
+
+  // Mark a specific historical period paid (from the archive view).
+  function markPeriodPaid(env, key) {
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const list = new Set([...(e.manualPaidPeriods || []), ...(e.manualPaidPeriod ? [e.manualPaidPeriod] : [])]);
+      list.add(key);
+      return { ...e, manualPaidPeriods: [...list], manualPaidPeriod: undefined };
+    }));
+    showToast("Marked paid");
   }
 
   async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
@@ -609,22 +638,21 @@ export default function App() {
       {/* ═══ BILLS ═══ */}
       {tab === "bills" && (
         <div style={S.page}>
-          <div className="sec">Bills & Debts</div>
           {bills.length === 0 ? (
-            <div className="card" style={{padding:28,textAlign:"center"}}>
-              <div style={{fontSize:36,marginBottom:10}}>◎</div>
-              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No bills yet</div>
-              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
-                Recurring and Debt envelopes show up here automatically.
+            <>
+              <div className="sec">Bills</div>
+              <div className="card" style={{padding:28,textAlign:"center"}}>
+                <div style={{fontSize:36,marginBottom:10}}>◎</div>
+                <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No bills yet</div>
+                <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                  Recurring and Debt envelopes show up here automatically.
+                </div>
+                <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.RECURRING})}>Add a Bill</button>
               </div>
-              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.RECURRING})}>Add a Bill</button>
-            </div>
+            </>
           ) : (
-            <div style={{display:"flex",flexDirection:"column",gap:9}}>
-              {bills.slice().sort((a,b) => (nextDueDate(a)||0) - (nextDueDate(b)||0))
-                .map(env => <BillRow key={env.id} env={env} transactions={transactions}
-                    onOpen={()=>setDetailEnv(env)} onMarkPaid={()=>markPaid(env)} />)}
-            </div>
+            <BillsView bills={bills} transactions={transactions}
+              onOpen={env=>setDetailEnv(env)} onMarkPaid={env=>markPaid(env)} />
           )}
         </div>
       )}
@@ -721,7 +749,9 @@ export default function App() {
                       onEdit={()=>{ setEditEnv(detailEnv); setDetailEnv(null); }}
                       onDelete={()=>deleteEnvelope(detailEnv.id)}
                       onFund={()=>{ setFundEnv(detailEnv); setDetailEnv(null); }}
-                      onMarkPaid={()=>markPaid(detailEnv)} />}
+                      onMarkPaid={()=>markPaid(detailEnv)}
+                      onMarkPeriodPaid={markPeriodPaid}
+                      onUnmarkPeriod={unmarkPaid} />}
       {fundEnv   && <FundSheet env={envelopes.find(e=>e.id===fundEnv.id)} sts={sts} transactions={transactions}
                       onFund={a=>{fund(fundEnv.id,a); setFundEnv(null);}}
                       onUnfund={a=>{unfund(fundEnv.id,a); setFundEnv(null);}}
@@ -1093,6 +1123,121 @@ function EnvRow({ env, transactions, onOpen, onFund }) {
   );
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// BILLS VIEW — today up top, unpaid grouped by month, then a paid archive.
+// The whole point: no bill is ever in an ambiguous state.
+// ═════════════════════════════════════════════════════════════════════════════
+function BillsView({ bills, transactions, onOpen, onMarkPaid }) {
+  const today = new Date();
+  const todayStr = today.toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric" });
+
+  const unpaid = bills.filter(b => !isPaid(b, transactions))
+    .map(b => ({ env: b, due: nextDueDate(b) }))
+    .sort((a,b) => (a.due||0) - (b.due||0));
+
+  const paid = bills.filter(b => isPaid(b, transactions))
+    .map(b => ({ env: b, due: nextDueDate(b) }))
+    .sort((a,b) => (a.due||0) - (b.due||0));
+
+  // Group unpaid by "Month Year" of the due date, preserving sort order.
+  const groups = [];
+  const seen = new Map();
+  for (const item of unpaid) {
+    const label = item.due
+      ? item.due.toLocaleDateString("en-US", { month:"long", year:"numeric" })
+      : "No date";
+    if (!seen.has(label)) { seen.set(label, groups.length); groups.push({ label, items: [] }); }
+    groups[seen.get(label)].items.push(item);
+  }
+
+  const totalDue = unpaid.reduce((s,x) => s + Math.max(0, targetAmount(x.env) - (x.env.funded||0)), 0);
+
+  return (
+    <>
+      {/* Today + at-a-glance */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:16}}>
+        <div>
+          <div style={{fontSize:12,color:"#8e8e93",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px",marginBottom:2}}>Today</div>
+          <div style={{fontSize:19,fontWeight:700,letterSpacing:"-.5px"}}>{todayStr}</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:12,color:"#8e8e93"}}>{unpaid.length} unpaid</div>
+          {totalDue>0 && <div style={{fontSize:15,fontWeight:700,color:"#ffd60a",letterSpacing:"-.4px"}}>{money(totalDue)} to fund</div>}
+        </div>
+      </div>
+
+      {unpaid.length === 0 && (
+        <div className="card" style={{padding:"22px 20px",textAlign:"center",marginBottom:22,border:"1px solid #30d15833"}}>
+          <div style={{fontSize:30,marginBottom:8}}>✓</div>
+          <div style={{fontSize:15,fontWeight:600,color:"#30d158"}}>Every bill is handled</div>
+          <div style={{fontSize:13,color:"#636366",marginTop:3}}>Nothing outstanding. Nice.</div>
+        </div>
+      )}
+
+      {/* Unpaid, grouped by month */}
+      {groups.map(group => (
+        <div key={group.label} style={{marginBottom:20}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <div style={{fontSize:12.5,fontWeight:700,color:"#c5f135",textTransform:"uppercase",letterSpacing:".7px"}}>{group.label}</div>
+            <div style={{flex:1,height:".5px",background:"rgba(255,255,255,.1)"}}/>
+            <div style={{fontSize:11,color:"#48484a"}}>{group.items.length}</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:9}}>
+            {group.items.map(({env}) => (
+              <BillRow key={env.id} env={env} transactions={transactions}
+                onOpen={()=>onOpen(env)} onMarkPaid={()=>onMarkPaid(env)} />
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {/* Paid archive — the reassurance zone */}
+      {paid.length > 0 && (
+        <div style={{marginTop:6}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <div style={{fontSize:12.5,fontWeight:700,color:"#30d158",textTransform:"uppercase",letterSpacing:".7px"}}>Paid This Period</div>
+            <div style={{flex:1,height:".5px",background:"rgba(255,255,255,.1)"}}/>
+            <div style={{fontSize:11,color:"#48484a"}}>{paid.length}</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:9}}>
+            {paid.map(({env}) => (
+              <PaidBillRow key={env.id} env={env} transactions={transactions} onOpen={()=>onOpen(env)} />
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// A paid bill, styled like a receipt — unmistakable, settled, with the real
+// cleared amount and date. This is the confirmation an anxious brain needs.
+function PaidBillRow({ env, transactions, onOpen }) {
+  const actual = paidThisPeriod(env, transactions);
+  const manual = actual <= 0;   // paid via manual mark, no cleared transaction
+  const hist = paymentHistory(env, transactions, 2);
+  const paidDate = hist[0]?.paidDate;
+
+  return (
+    <button className="card row-tap" onClick={onOpen}
+      style={{padding:"13px 15px",width:"100%",textAlign:"left",border:"1px solid #30d15825",background:"#16211a",fontFamily:"inherit",color:"#fff",cursor:"pointer"}}>
+      <div style={{display:"flex",alignItems:"center",gap:11}}>
+        <div className="ibox" style={{background:"#30d15826",color:"#30d158",fontSize:18}}>✓</div>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:15,fontWeight:600}}>{env.name}</div>
+          <div style={{fontSize:12,color:"#30d158",marginTop:2,fontWeight:500}}>
+            {manual ? "Marked paid" : `Paid${paidDate?` ${new Date(paidDate+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}`:""}`}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>{money(manual ? targetAmount(env) : actual)}</div>
+          <div style={{fontSize:10.5,color:"#8e8e93"}}>{manual ? "confirmed" : "cleared"}</div>
+        </div>
+      </div>
+    </button>
+  );
+}
+
 function BillRow({ env, transactions, onOpen, onMarkPaid }) {
   const paid = isPaid(env, transactions);
   const locked = isLocked(env, transactions);
@@ -1361,7 +1506,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, onMarkPaid }) {
+function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
@@ -1460,6 +1605,40 @@ function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, 
       <button className="btn-dim" style={{marginBottom:8}} onClick={onFund} disabled={locked}>
         {locked ? "🔒 Funds locked" : "Fund / release money"}
       </button>
+
+      {isBill(env.type) && (
+        <>
+          <Label style={{marginTop:14}}>Payment history</Label>
+          <div className="grp" style={{marginBottom:12}}>
+            {paymentHistory(env, transactions, 6).map(p => (
+              <div key={p.key} className="row" style={{padding:"11px 14px"}}>
+                <div style={{width:26,height:26,borderRadius:8,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,
+                  background:p.upcoming?"#2c2c2e":p.paid?"#30d15826":"#ff375f26",
+                  color:p.upcoming?"#8e8e93":p.paid?"#30d158":"#ff375f"}}>
+                  {p.upcoming?"•":p.paid?"✓":"!"}
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:14,fontWeight:500}}>{p.label}</div>
+                  <div style={{fontSize:11.5,color:p.missed?"#ff375f":"#636366",marginTop:1}}>
+                    {p.upcoming ? "Upcoming"
+                      : p.paid ? (p.manual && p.amount<=0 ? "Marked paid" : `Paid${p.paidDate?` ${new Date(p.paidDate+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}`:""}`)
+                      : "Missed — no payment found"}
+                  </div>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  {p.amount>0
+                    ? <div style={{fontSize:14,fontWeight:600,color:"#30d158"}}>{money(p.amount)}</div>
+                    : p.missed
+                      ? <button className="btn-mini" style={{padding:"5px 10px",fontSize:12}} onClick={()=>onMarkPeriodPaid(env, p.key)}>Mark paid</button>
+                      : p.manual
+                        ? <button className="btn-mini" style={{padding:"5px 10px",fontSize:12,color:"#8e8e93"}} onClick={()=>onUnmarkPeriod(env, p.key)}>Undo</button>
+                        : <span style={{fontSize:12,color:"#48484a"}}>—</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {txs.length > 0 && (
         <>
