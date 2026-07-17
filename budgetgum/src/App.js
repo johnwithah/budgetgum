@@ -1256,7 +1256,13 @@ function BillRow({ env, transactions, onOpen, onMarkPaid }) {
             {locked && <span style={{fontSize:11}}>🔒</span>}
           </div>
           <div style={{fontSize:12,color:paid?"#48484a":urg,marginTop:2,fontWeight:500}}>
-            {paid ? `Paid ${money(actual)}` : days===0 ? "Due today" : days===1 ? "Due tomorrow" : `Due in ${days} days`}
+            {paid
+              ? `Paid ${money(actual)}`
+              : (() => {
+                  const dateStr = due ? due.toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "";
+                  const countdown = days===0 ? "Due today" : days===1 ? "Due tomorrow" : days<0 ? `${Math.abs(days)} days overdue` : `Due in ${days} days`;
+                  return due ? `${dateStr} · ${countdown}` : countdown;
+                })()}
             {!paid && env.autopay && ` · autopay`}
           </div>
         </div>
