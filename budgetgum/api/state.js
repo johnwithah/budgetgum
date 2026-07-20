@@ -29,6 +29,7 @@ const EMPTY = {
   ignored: [],
   lastSync: null,
   importSince: '2026-07-14',
+  autoLockMinutes: 10,
   updatedAt: null,
 };
 
@@ -65,6 +66,7 @@ module.exports = async (req, res) => {
       ignored:      body.ignored      || [],
       lastSync:     body.lastSync     || null,
       importSince:  body.importSince  || '2026-07-14',
+      autoLockMinutes: typeof body.autoLockMinutes === 'number' ? body.autoLockMinutes : 10,
       updatedAt:    Date.now(),
     };
 
