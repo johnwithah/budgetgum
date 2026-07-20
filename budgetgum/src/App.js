@@ -6,7 +6,7 @@ import {
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
   billAmountStats, amountDrift,
-  safeToSpend, shortfall, upcomingLocks, buildAlerts,
+  safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
   money, daysBetween, DOW,
 } from "./engine";
@@ -119,7 +119,7 @@ export default function App() {
   );
 
   const sts    = safeToSpend(envelopes, checkingBalance);
-  const alerts = useMemo(() => buildAlerts(envelopes, transactions, checkingBalance), [envelopes, transactions, checkingBalance]);
+  const alerts = useMemo(() => buildAlerts(envelopes, transactions, checkingBalance, state.importSince || "2026-07-14"), [envelopes, transactions, checkingBalance, state.importSince]);
   const locks  = useMemo(() => upcomingLocks(envelopes, transactions), [envelopes, transactions]);
   const bills  = envelopes.filter(e => isBill(e.type));
   const debts  = envelopes.filter(e => e.type === TYPES.DEBT);
@@ -689,7 +689,7 @@ export default function App() {
               </div>
             </>
           ) : (
-            <BillsView bills={bills} transactions={transactions}
+            <BillsView bills={bills} transactions={transactions} dataSince={state.importSince || "2026-07-14"}
               onOpen={env=>setDetailEnv(env)} onMarkPaid={env=>markPaid(env)} />
           )}
         </div>
@@ -1168,19 +1168,26 @@ function EnvRow({ env, transactions, onOpen, onFund }) {
 // BILLS VIEW — today up top, unpaid grouped by month, then a paid archive.
 // The whole point: no bill is ever in an ambiguous state.
 // ═════════════════════════════════════════════════════════════════════════════
-function BillsView({ bills, transactions, onOpen, onMarkPaid }) {
+function BillsView({ bills, transactions, dataSince, onOpen, onMarkPaid }) {
   const today = new Date();
   const todayStr = today.toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric" });
 
-  const unpaid = bills.filter(b => !isPaid(b, transactions))
-    .map(b => ({ env: b, due: nextDueDate(b) }))
+  const allUnpaid = bills.filter(b => !isPaid(b, transactions))
+    .map(b => ({ env: b, due: nextDueDate(b), overdue: overdueInfo(b, transactions, dataSince) }))
     .sort((a,b) => (a.due||0) - (b.due||0));
+
+  // A bill whose due date passed unpaid has already rolled its next due date
+  // forward — so grouping by that date would file a missed JULY bill under
+  // AUGUST. Pull those out into their own section at the top instead, where
+  // they read as what they are: late, not upcoming.
+  const overdue = allUnpaid.filter(x => x.overdue);
+  const unpaid  = allUnpaid.filter(x => !x.overdue);
 
   const paid = bills.filter(b => isPaid(b, transactions))
     .map(b => ({ env: b, due: nextDueDate(b) }))
     .sort((a,b) => (a.due||0) - (b.due||0));
 
-  // Group unpaid by "Month Year" of the due date, preserving sort order.
+  // Group the rest by "Month Year" of the due date, preserving sort order.
   const groups = [];
   const seen = new Map();
   for (const item of unpaid) {
@@ -1191,7 +1198,7 @@ function BillsView({ bills, transactions, onOpen, onMarkPaid }) {
     groups[seen.get(label)].items.push(item);
   }
 
-  const totalDue = unpaid.reduce((s,x) => s + Math.max(0, targetAmount(x.env) - (x.env.funded||0)), 0);
+  const totalDue = allUnpaid.reduce((s,x) => s + Math.max(0, targetAmount(x.env) - (x.env.funded||0)), 0);
 
   return (
     <>
@@ -1202,16 +1209,35 @@ function BillsView({ bills, transactions, onOpen, onMarkPaid }) {
           <div style={{fontSize:19,fontWeight:700,letterSpacing:"-.5px"}}>{todayStr}</div>
         </div>
         <div style={{textAlign:"right"}}>
-          <div style={{fontSize:12,color:"#8e8e93"}}>{unpaid.length} unpaid</div>
+          <div style={{fontSize:12,color:"#8e8e93"}}>{allUnpaid.length} unpaid</div>
           {totalDue>0 && <div style={{fontSize:15,fontWeight:700,color:"#ffd60a",letterSpacing:"-.4px"}}>{money(totalDue)} to fund</div>}
         </div>
       </div>
 
-      {unpaid.length === 0 && (
+      {allUnpaid.length === 0 && (
         <div className="card" style={{padding:"22px 20px",textAlign:"center",marginBottom:22,border:"1px solid #30d15833"}}>
           <div style={{fontSize:30,marginBottom:8}}>✓</div>
           <div style={{fontSize:15,fontWeight:600,color:"#30d158"}}>Every bill is handled</div>
           <div style={{fontSize:13,color:"#636366",marginTop:3}}>Nothing outstanding. Nice.</div>
+        </div>
+      )}
+
+      {/* Overdue — pulled to the top, out of the month it would otherwise hide in */}
+      {overdue.length > 0 && (
+        <div style={{marginBottom:22}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <div style={{fontSize:12.5,fontWeight:700,color:"#ff375f",textTransform:"uppercase",letterSpacing:".7px"}}>
+              Overdue
+            </div>
+            <div style={{flex:1,height:".5px",background:"rgba(255,55,95,.25)"}}/>
+            <div style={{fontSize:11,color:"#ff375f"}}>{overdue.length}</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:9}}>
+            {overdue.map(({env}) => (
+              <BillRow key={env.id} env={env} transactions={transactions} dataSince={dataSince}
+                onOpen={()=>onOpen(env)} onMarkPaid={()=>onMarkPaid(env)} />
+            ))}
+          </div>
         </div>
       )}
 
@@ -1225,7 +1251,7 @@ function BillsView({ bills, transactions, onOpen, onMarkPaid }) {
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:9}}>
             {group.items.map(({env}) => (
-              <BillRow key={env.id} env={env} transactions={transactions}
+              <BillRow key={env.id} env={env} transactions={transactions} dataSince={dataSince}
                 onOpen={()=>onOpen(env)} onMarkPaid={()=>onMarkPaid(env)} />
             ))}
           </div>
@@ -1279,16 +1305,30 @@ function PaidBillRow({ env, transactions, onOpen }) {
   );
 }
 
-function BillRow({ env, transactions, onOpen, onMarkPaid }) {
+function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
   const paid = isPaid(env, transactions);
   const locked = isLocked(env, transactions);
   const due = nextDueDate(env);
   const days = due ? daysBetween(new Date(), due) : null;
   const amt = targetAmount(env);
   const actual = paidThisPeriod(env, transactions);
-  const urg = days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
+  const overdue = paid ? null : overdueInfo(env, transactions, dataSince);
+  const urg = overdue ? "#ff375f" : days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
   return (
-    <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1}}>
+    <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1,
+      border: overdue && !overdue.pending ? "1px solid #ff375f66" : "1px solid transparent",
+      background: overdue && !overdue.pending ? "#241014" : undefined}}>
+      {overdue && (
+        <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:10,paddingBottom:10,
+          borderBottom:".5px solid rgba(255,255,255,.08)"}}>
+          <span style={{fontSize:14}}>{overdue.pending ? "⏳" : "🚨"}</span>
+          <div style={{fontSize:12,fontWeight:600,color:overdue.pending?"#ffd60a":"#ff375f",lineHeight:1.4}}>
+            {overdue.pending
+              ? `Due ${overdue.period.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} — payment hasn't posted yet`
+              : `${overdue.period.label} payment never posted · ${overdue.daysPast} days late`}
+          </div>
+        </div>
+      )}
       <div style={{display:"flex",alignItems:"center",gap:11}}>
         <div className="ibox" style={{background:paid?"#30d15822":urg+"22"}}>{paid?"✓":env.icon}</div>
         <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={onOpen}>

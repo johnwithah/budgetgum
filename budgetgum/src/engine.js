@@ -575,7 +575,41 @@ export function upcomingLocks(envelopes, transactions, withinDays = 7) {
 }
 
 // ── Alerts ───────────────────────────────────────────────────────────────────
-export function buildAlerts(envelopes, transactions, checkingBalance) {
+// ═════════════════════════════════════════════════════════════════════════════
+// OVERDUE — a due date came and went with nothing posted.
+//
+// This is the gap `nextDueDate` leaves: it always rolls FORWARD, so the instant
+// a due date passes the app starts counting toward next month and the missed
+// one quietly disappears. That's the single worst failure for a bill tracker —
+// silence where there should be a siren.
+//
+// Grace matters here. A payment made on the due date often posts a day or two
+// later, so we don't cry wolf immediately: within the grace window it's "hasn't
+// posted yet," beyond it it's genuinely overdue.
+// ═════════════════════════════════════════════════════════════════════════════
+export function overdueInfo(env, transactions, dataSince = null) {
+  if (!isBill(env.type)) return null;
+
+  // Look back a few periods for any that came due and were never satisfied.
+  const missed = paymentHistory(env, transactions, 4, dataSince)
+    .filter(p => p.missed)
+    .sort((a, b) => b.dueDate - a.dueDate);   // most recent first
+
+  if (!missed.length) return null;
+
+  const latest = missed[0];
+  const daysPast = daysBetween(latest.dueDate, new Date());
+
+  return {
+    period: latest,
+    daysPast,
+    count: missed.length,
+    // Inside the grace window a payment may simply not have posted yet.
+    pending: daysPast <= GRACE_DAYS,
+  };
+}
+
+export function buildAlerts(envelopes, transactions, checkingBalance, dataSince = null) {
   const alerts = [];
   const sts = safeToSpend(envelopes, checkingBalance);
 
@@ -586,6 +620,25 @@ export function buildAlerts(envelopes, transactions, checkingBalance) {
     const short = shortfall(env, transactions);
     const due = nextDueDate(env);
     const daysToDue = due ? daysBetween(new Date(), due) : null;
+
+    // 🚨 A due date passed with nothing posted. This outranks everything else —
+    // it's the one thing you'd never find out about on your own, because the
+    // app would otherwise just quietly start counting toward next month.
+    const overdue = overdueInfo(env, transactions, dataSince);
+    if (overdue) {
+      const p = overdue.period;
+      alerts.push({
+        level: overdue.pending ? "warn" : "critical",
+        env,
+        title: overdue.pending
+          ? `${env.name} — payment hasn't posted`
+          : `${env.name} — ${p.label} payment never posted`,
+        body: overdue.pending
+          ? `Due ${p.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})}. Give it a day or two, then check with the biller.`
+          : `${money(targetAmount(env))} was due ${p.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} — ${overdue.daysPast} days ago. Nothing has cleared.${overdue.count > 1 ? ` (${overdue.count} periods missed.)` : ""}`,
+      });
+      continue;
+    }
 
     // 🚨 The loudest one: it's locked and underfunded. The bank is pulling the
     // full amount regardless. This is an overdraft warning, not a budget note.
