@@ -506,6 +506,54 @@ export default function App() {
     showToast(key ? "Applied to that period" : "Back to automatic");
   }
 
+  // Flip a transaction that was imported with the wrong sign.
+  //
+  // Before the sign fix, the API ran Math.abs() on every amount, so deposits
+  // came in looking like charges. Those are still sitting in your history as
+  // positive numbers. This reverses whatever effect the transaction had on its
+  // envelope, flips it to an inflow, and detaches it — turning it back into the
+  // deposit it always was.
+  function convertToDeposit(tx) {
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.map(t => t.id === tx.id
+        ? { ...t, amount: -Math.abs(t.amount), envelopeId: null, kind: "deposit", periodOverride: undefined }
+        : t),
+      envelopes: s.envelopes.map(e =>
+        e.id === tx.envelopeId ? unapplyPayments(e, [tx]) : e),
+    }));
+    setTxDetail(null);
+    showToast("Moved to income");
+  }
+
+  // The same repair, in bulk. Finds charges whose merchant matches something
+  // already known to be an income source.
+  const miscategorizedDeposits = useMemo(() => {
+    const incomeNames = new Set(
+      incomeTransactions(transactions).map(t => normalizeMerchant(t.desc)).filter(Boolean)
+    );
+    if (!incomeNames.size) return [];
+    return transactions.filter(t =>
+      t.amount > 0 && incomeNames.has(normalizeMerchant(t.desc))
+    );
+  }, [transactions]);
+
+  function fixAllDeposits() {
+    const ids = new Set(miscategorizedDeposits.map(t => t.id));
+    if (!ids.size) return;
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.map(t => ids.has(t.id)
+        ? { ...t, amount: -Math.abs(t.amount), envelopeId: null, kind: "deposit", periodOverride: undefined }
+        : t),
+      envelopes: s.envelopes.map(e => {
+        const hits = miscategorizedDeposits.filter(t => t.envelopeId === e.id);
+        return hits.length ? unapplyPayments(e, hits) : e;
+      }),
+    }));
+    showToast(`Moved ${ids.size} to income`);
+  }
+
   function markPaid(env) {
     const key = periodKey(env);
     setEnvelopes(p => p.map(e => {
@@ -889,7 +937,17 @@ export default function App() {
             </div>
           ) : (
             <div className="grp">
-              {transactions.slice(0,80).map(tx => {
+              {transactions
+                .slice()
+                // Sort by date, not insertion order. Transactions arrive in
+                // whatever order the bank hands them over, and changing the
+                // import cutoff backfills older ones after newer ones are
+                // already in the list — so the raw array is not chronological.
+                .sort((a, b) => (a.date === b.date
+                  ? String(a.id).localeCompare(String(b.id))
+                  : (a.date < b.date ? 1 : -1)))
+                .slice(0, 80)
+                .map(tx => {
                 const env = envelopes.find(e => e.id === tx.envelopeId);
                 const isDeposit = tx.amount <= 0 || tx.kind === "deposit";
                 return (
@@ -924,6 +982,8 @@ export default function App() {
       {/* ═══ SHEETS ═══ */}
       {settings  && <SettingsSheet state={state} saveNow={saveNow} syncStatus={syncStatus}
                       bankConnected={bankConnected}
+                      miscategorized={miscategorizedDeposits}
+                      onFixDeposits={()=>{ fixAllDeposits(); setSettings(false); }}
                       onDisconnectBank={async()=>{ await api("/api/disconnect_bank"); setBankConnected(false); setAccounts([]); showToast("Bank disconnected"); }}
                       onLogout={logout} onClose={()=>setSettings(false)} onToast={showToast} />}
       {editEnv   && <EnvelopeForm initial={editEnv} onSave={saveEnvelope} onCancel={()=>setEditEnv(null)} />}
@@ -964,6 +1024,7 @@ export default function App() {
                       onRequeue={requeueTransaction}
                       onDelete={deleteTransaction}
                       onSetPeriod={setTransactionPeriod}
+                      onConvertToDeposit={convertToDeposit}
                       onClose={()=>setTxDetail(null)} />}
     </div>
   );
@@ -1297,7 +1358,7 @@ function IncomeView({ transactions, onOpenTx }) {
 // ═════════════════════════════════════════════════════════════════════════════
 // TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
 // ═════════════════════════════════════════════════════════════════════════════
-function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onClose }) {
+function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onConvertToDeposit, onClose }) {
   const [moving, setMoving] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const env = envelopes.find(e => e.id === tx.envelopeId);
@@ -1434,6 +1495,12 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
         </button>
       )}
 
+      {!isDeposit && (
+        <button className="btn-dim" style={{marginBottom:8}} onClick={()=>onConvertToDeposit(tx)}>
+          This is income, not a charge
+        </button>
+      )}
+
       {!confirmDel ? (
         <button className="btn-dim" style={{color:"#ff375f"}} onClick={()=>setConfirmDel(true)}>Delete transaction</button>
       ) : (
@@ -1474,7 +1541,7 @@ function SyncDot({ status }) {
 // ═════════════════════════════════════════════════════════════════════════════
 // SETTINGS — backup, restore, bank, lock
 // ═════════════════════════════════════════════════════════════════════════════
-function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnectBank, onLogout, onClose, onToast }) {
+function SettingsSheet({ state, saveNow, syncStatus, bankConnected, miscategorized, onFixDeposits, onDisconnectBank, onLogout, onClose, onToast }) {
   const [restoring, setRestoring] = useState(false);
   const [json, setJson] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
@@ -1556,6 +1623,35 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
           <span style={{fontSize:14.5,fontWeight:600}}>{state.transactions.length}</span>
         </div>
       </div>
+
+      {/* Repair for transactions imported before the sign fix */}
+      {miscategorized.length > 0 && (
+        <div className="grp" style={{marginBottom:8,padding:"13px 15px",border:"1px solid #ffd60a33"}}>
+          <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>
+            {miscategorized.length} deposit{miscategorized.length===1?"":"s"} recorded as charges
+          </div>
+          <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+            These match merchants you already receive income from, but were imported before
+            deposits were handled correctly. Moving them fixes your income totals and undoes
+            any effect they had on envelopes.
+          </div>
+          <div style={{marginBottom:10}}>
+            {miscategorized.slice(0,5).map(t=>(
+              <div key={t.id} style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#aeaeb2",padding:"3px 0"}}>
+                <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginRight:8}}>{t.desc}</span>
+                <span style={{flexShrink:0}}>{t.date}</span>
+              </div>
+            ))}
+            {miscategorized.length>5 && (
+              <div style={{fontSize:11.5,color:"#636366",marginTop:3}}>+{miscategorized.length-5} more</div>
+            )}
+          </div>
+          <button className="btn-mini" style={{background:"#c5f135",color:"#000",width:"100%"}}
+            onClick={onFixDeposits}>
+            Move {miscategorized.length} to income
+          </button>
+        </div>
+      )}
 
       {/* Auto-lock */}
       <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
