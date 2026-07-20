@@ -137,12 +137,33 @@ export function addDays(date, n) {
 }
 
 // The due date this payment should be credited to.
+//
+// Rule: whichever due date the payment is NEAREST to.
+//
+// The obvious-looking alternative — "snap forward from (date − grace)" — is
+// broken, and broken in a way that quietly corrupts two months at once. A bill
+// due the 5th, paid on the 15th, is 10 days late; snapping forward files it
+// under NEXT month. So the month it was actually for reads "missed," and the
+// following month reads "already paid" and vanishes from upcoming.
+//
+// Nearest-due has no such cliff. It scales correctly across weekly, monthly,
+// and annual bills, and it reads the way a person would: a payment a few days
+// after the 5th is obviously for the 5th; a payment a few days before the next
+// one is obviously paying that one early. Ties go to the due date already
+// passed, since bills are far more often paid late than early.
 export function periodDueFor(env, dateStr) {
   const paid = startOfDay(new Date(dateStr + "T00:00:00"));
   if (isNaN(paid.getTime())) return null;
-  // Shift back by the grace window, then snap forward to the next due date.
-  // Paying up to GRACE_DAYS late still credits the due date just passed.
-  return nextDueDate(env, addDays(paid, -GRACE_DAYS));
+
+  const next = nextDueDate(env, addDays(paid, 1));   // first due strictly after
+  if (!next) return null;
+  const prev = prevDueDate(env, next);               // the one before that
+  if (!prev) return next;
+
+  const distPrev = daysBetween(prev, paid);          // >= 0
+  const distNext = daysBetween(paid, next);          // > 0
+
+  return distPrev <= distNext ? prev : next;
 }
 
 const keyOf = d => (d ? d.toISOString().split("T")[0] : "");
