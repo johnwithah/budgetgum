@@ -96,6 +96,11 @@ module.exports = async (req, res) => {
         amount: t.amount,
         date: t.date,
         category: t.personal_finance_category?.primary || t.category?.[0] || 'Other',
+        // Merchant branding, when Plaid has enriched this transaction. Not
+        // always present — depends on the merchant and your Plaid plan — so the
+        // app treats it as a bonus, never a requirement.
+        logo: t.logo_url || null,
+        website: t.website || null,
         pending: t.pending,
         type: 'bank',
       }));
