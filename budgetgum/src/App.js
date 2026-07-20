@@ -159,25 +159,63 @@ export default function App() {
   useEffect(() => { checkSession(); }, [checkSession]);
 
   // ── Auto-fund on lock day ─────────────────────────────────────────────────
+  // A lock date arriving is a TIME event, not a state change — nothing in React
+  // re-renders just because the clock rolled past it. The old version only
+  // watched envelope/transaction COUNTS, so it fired on app open and basically
+  // never again: toggling autopay, editing an amount, or a balance arriving
+  // from the bank all left it asleep.
+  //
+  // Now it watches what the decision actually depends on, and ticks once a
+  // minute so a lock that lands while the app is open is caught immediately.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick(n => n + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  // A fingerprint of every input to the auto-fund decision. When any of it
+  // moves, the effect re-evaluates.
+  const autofundKey = useMemo(() =>
+    envelopes
+      .filter(e => e.autopay && isBill(e.type))
+      .map(e => [
+        e.id,
+        e.funded || 0,
+        targetAmount(e),
+        isLocked(e, transactions) ? 1 : 0,
+        isPaid(e, transactions) ? 1 : 0,
+      ].join(":"))
+      .join("|"),
+    [envelopes, transactions]
+  );
+
   useEffect(() => {
     if (authState !== "unlocked" || !envelopes.length) return;
+
     let available = sts;
     let changed = false;
+    let fundedTotal = 0;
+
     const next = envelopes.map(env => {
       if (!env.autopay || !isBill(env.type)) return env;
       if (isPaid(env, transactions)) return env;
       if (!isLocked(env, transactions)) return env;
       const need = targetAmount(env) - (env.funded || 0);
-      if (need <= 0) return env;
+      if (need <= 0.005) return env;                    // already covered
       const grab = Math.min(need, Math.max(0, available));
-      if (grab <= 0) return env;
+      if (grab <= 0.005) return env;                    // nothing spare to give
       available -= grab;
+      fundedTotal += grab;
       changed = true;
       return { ...env, funded: (env.funded || 0) + grab };
     });
-    if (changed) setEnvelopes(next);
+
+    if (changed) {
+      setEnvelopes(next);
+      showToast(`Auto-funded ${money(fundedTotal)} for locked bills`);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authState, envelopes.length, transactions.length]);
+  }, [authState, autofundKey, sts, tick]);
 
   // ── Sync with bank ────────────────────────────────────────────────────────
   const syncBank = useCallback(async () => {
