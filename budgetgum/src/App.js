@@ -243,10 +243,18 @@ export default function App() {
 
       const matched = [], needsAssign = [], deposits = [];
       fresh.forEach(t => {
-        // Inflows (deposits, refunds — amount <= 0) are recorded but never
-        // queued for sorting and never touch envelopes. Checking balance
-        // already reflects them.
-        if (t.amount <= 0) { deposits.push({ ...t, envelopeId: null, kind: "deposit" }); return; }
+        if (t.amount <= 0) {
+          // A credit. Is it a refund from somewhere you spend, or income?
+          // We can't know from the transaction itself — but if its merchant
+          // matches an envelope you've already taught, a refund is the far more
+          // likely story, so we ask instead of assuming.
+          const envId = matchEnvelope(t, envelopes);
+          const looksLikeRefund = Boolean(envId) &&
+            envelopes.find(e => e.id === envId)?.type === TYPES.SPENDING;
+          if (looksLikeRefund) needsAssign.push({ ...t, likelyRefund: true, suggestedEnvelopeId: envId });
+          else deposits.push({ ...t, envelopeId: null, kind: "deposit" });
+          return;
+        }
         const envId = matchEnvelope(t, envelopes);
         if (envId) matched.push({ ...t, envelopeId: envId });
         else needsAssign.push(t);
@@ -304,9 +312,17 @@ export default function App() {
   // Applying a payment to an envelope: a debt balance drops, a goal grows, and
   // for a bill the funded amount settles to 0 (unused reservation released).
   //
-  // Only OUTFLOWS (money leaving, amount > 0) act on envelopes. Deposits are
-  // recorded but never applied — the checking balance already reflects them.
+  // BILLS/DEBTS/GOALS only act on outflows — a refund shouldn't un-pay a bill.
+  // SPENDING envelopes net both directions: a refund puts money back where you
+  // spent it, which is the whole point of assigning it there.
   function applyPayments(env, payments) {
+    if (!payments.length) return env;
+
+    if (env.type === TYPES.SPENDING) {
+      const net = payments.reduce((s,t) => s + t.amount, 0);   // outflow +, refund −
+      return { ...env, funded: Math.max(0, (env.funded || 0) - net) };
+    }
+
     const outflows = payments.filter(t => t.amount > 0);
     if (!outflows.length) return env;
     const total = outflows.reduce((s,t) => s + t.amount, 0);
@@ -314,7 +330,6 @@ export default function App() {
     if (env.type === TYPES.DEBT)      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
     else if (env.type === TYPES.GOAL) next.currentBalance = (env.currentBalance || 0) + total;
     if (isBill(env.type)) next.funded = 0;
-    else next.funded = Math.max(0, (env.funded || 0) - total);
     return next;
   }
 
@@ -326,6 +341,13 @@ export default function App() {
   // Reversing the balance is the part that must be right (it's what corrupts
   // your payoff math); the funded reset is cosmetic and self-heals next period.
   function unapplyPayments(env, payments) {
+    if (!payments.length) return env;
+
+    if (env.type === TYPES.SPENDING) {
+      const net = payments.reduce((s,t) => s + t.amount, 0);
+      return { ...env, funded: Math.max(0, (env.funded || 0) + net) };
+    }
+
     const outflows = payments.filter(t => t.amount > 0);
     if (!outflows.length) return env;
     const total = outflows.reduce((s,t) => s + t.amount, 0);
@@ -908,7 +930,19 @@ export default function App() {
                       onClose={()=>setFundEnv(null)} />}
       {mapTx     && <AssignSheet tx={mapTx} envelopes={envelopes}
                       onAssign={assignTx}
-                      onSkip={()=>{ setUnmapped(p=>p.filter(t=>t.id!==mapTx.id)); setMapTx(null); }}
+                      onSkip={()=>{
+                        // A skipped credit is income — keep it in the record so
+                        // earnings history stays complete. A skipped debit was
+                        // never a budget item, so it just leaves the queue.
+                        setState(s => ({
+                          ...s,
+                          unmapped: s.unmapped.filter(t => t.id !== mapTx.id),
+                          transactions: mapTx.amount <= 0
+                            ? [{ ...mapTx, envelopeId: null, kind: "deposit", likelyRefund: undefined }, ...s.transactions]
+                            : s.transactions,
+                        }));
+                        setMapTx(null);
+                      }}
                       onClose={()=>setMapTx(null)} />}
       {txDetail  && <TransactionDetail tx={txDetail} envelopes={envelopes}
                       onMove={moveTransaction}
@@ -969,6 +1003,118 @@ function EnvIcon({ env, size = 36, radius = 10, bg, style }) {
   );
 }
 // ═════════════════════════════════════════════════════════════════════════════
+// ENVELOPE TRANSACTIONS — the list that has to add up.
+//
+// The old version showed "the 10 most recent, any month" next to a total that
+// meant "everything this month." Two different questions, one screen, numbers
+// that couldn't reconcile. If a total is on screen, you should be able to count
+// the rows and arrive at it.
+//
+// So: this month's transactions in full, with the sum stated at the bottom, and
+// anything older tucked behind a toggle. Refunds are shown but marked, since
+// they deliberately don't reduce spending.
+// ═════════════════════════════════════════════════════════════════════════════
+function EnvelopeTransactions({ env, transactions }) {
+  const [showEarlier, setShowEarlier] = useState(false);
+
+  const mine = transactions
+    .filter(t => t.envelopeId === env.id)
+    .slice()
+    .sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  if (!mine.length) return null;
+
+  const now = new Date();
+  const m = now.getMonth(), y = now.getFullYear();
+  const inThisMonth = t => {
+    const d = new Date(t.date + "T00:00:00");
+    return d.getMonth() === m && d.getFullYear() === y;
+  };
+
+  const thisMonth = mine.filter(inThisMonth);
+  const earlier   = mine.filter(t => !inThisMonth(t));
+
+  const outflows = thisMonth.filter(t => t.amount > 0);
+  const refunds  = thisMonth.filter(t => t.amount <= 0);
+  const gross    = outflows.reduce((s, t) => s + t.amount, 0);
+  const returned = refunds.reduce((s, t) => s + Math.abs(t.amount), 0);
+  const total    = gross - returned;
+
+  const monthLabel = now.toLocaleDateString("en-US", { month: "long" });
+
+  const Row = ({ t, dim }) => {
+    const isIn = t.amount <= 0;
+    return (
+      <div className="row" style={{padding:"11px 14px",opacity:dim?.6:1}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:14,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.desc}</div>
+          <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>
+            {new Date(t.date+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+            {isIn && " · refund"}
+          </div>
+        </div>
+        <div style={{fontSize:14,fontWeight:600,color:isIn?"#30d158":"#aeaeb2"}}>
+          {isIn ? `+${money(Math.abs(t.amount))}` : `−${money(t.amount)}`}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <Label style={{marginTop:14}}>
+        {monthLabel} · {thisMonth.length} transaction{thisMonth.length===1?"":"s"}
+      </Label>
+
+      {thisMonth.length === 0 ? (
+        <div className="card" style={{padding:16,marginBottom:12,fontSize:13,color:"#636366",textAlign:"center"}}>
+          Nothing yet this month.
+        </div>
+      ) : (
+        <div className="grp" style={{marginBottom:12}}>
+          {outflows.map(t => <Row key={t.id} t={t} />)}
+          {refunds.map(t => <Row key={t.id} t={t} />)}
+          {returned > 0 && (
+            <div className="row" style={{padding:"10px 14px"}}>
+              <div style={{flex:1,fontSize:12.5,color:"#636366"}}>Spent {money(gross)}, refunded {money(returned)}</div>
+            </div>
+          )}
+          <div className="row" style={{padding:"12px 14px",background:"rgba(255,255,255,.03)"}}>
+            <div style={{flex:1,fontSize:13.5,fontWeight:600,color:"#8e8e93"}}>
+              Net spent in {monthLabel}
+            </div>
+            <div style={{fontSize:15,fontWeight:700,letterSpacing:"-.3px"}}>{money(total)}</div>
+          </div>
+        </div>
+      )}
+
+      {earlier.length > 0 && (
+        !showEarlier ? (
+          <button className="btn-dim" style={{marginBottom:12,fontSize:13.5}}
+            onClick={()=>setShowEarlier(true)}>
+            Show {earlier.length} earlier transaction{earlier.length===1?"":"s"}
+          </button>
+        ) : (
+          <>
+            <Label>Earlier</Label>
+            <div className="grp" style={{marginBottom:12}}>
+              {earlier.slice(0,50).map(t => <Row key={t.id} t={t} dim />)}
+            </div>
+            {earlier.length > 50 && (
+              <div style={{fontSize:11.5,color:"#48484a",textAlign:"center",marginBottom:12}}>
+                Showing the 50 most recent of {earlier.length}
+              </div>
+            )}
+            <button className="btn-dim" style={{marginBottom:12,fontSize:13.5}}
+              onClick={()=>setShowEarlier(false)}>Hide earlier</button>
+          </>
+        )
+      )}
+    </>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
 // ═════════════════════════════════════════════════════════════════════════════
 function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onClose }) {
@@ -999,11 +1145,39 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
         )}
       </div>
 
-      {isDeposit ? (
-        <div className="card" style={{padding:16,marginBottom:8,fontSize:13,color:"#8e8e93",lineHeight:1.55,textAlign:"center"}}>
-          This is money coming in. It's already reflected in your checking balance, so it isn't
-          sorted into an envelope. You can still delete it from your history.
-        </div>
+      {isDeposit && !env ? (
+        !moving ? (
+          <>
+            <div className="card" style={{padding:16,marginBottom:8,fontSize:13,color:"#8e8e93",lineHeight:1.55,textAlign:"center"}}>
+              Treated as income. It's already in your checking balance, so it isn't
+              subtracted from any envelope.
+            </div>
+            <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>
+              This was a refund — assign it
+            </button>
+          </>
+        ) : (
+          <div className="card" style={{padding:14,marginBottom:8}}>
+            <div style={{fontSize:13,color:"#8e8e93",marginBottom:4}}>Refund from…</div>
+            <div style={{fontSize:11.5,color:"#636366",marginBottom:10,lineHeight:1.5}}>
+              This will subtract from what you've spent in that envelope.
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              {envelopes.map(e => (
+                <button key={e.id} onClick={()=>onMove(tx, e.id)}
+                  style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"11px 14px",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",color:"#fff"}}>
+                  <EnvIcon env={e} size={30} radius={8} bg="transparent" />
+                  <div style={{flex:1,textAlign:"left"}}>
+                    <div style={{fontSize:15,fontWeight:500}}>{e.name}</div>
+                    <div style={{fontSize:12,color:"#8e8e93"}}>{TYPE_META[e.type].label}</div>
+                  </div>
+                  <span style={{color:"#48484a",fontSize:17}}>›</span>
+                </button>
+              ))}
+            </div>
+            <button className="btn-dim" style={{marginTop:10}} onClick={()=>setMoving(false)}>Cancel</button>
+          </div>
+        )
       ) : !moving ? (
         <>
           {/* Which billing period is this payment for? */}
@@ -1844,7 +2018,6 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
   const [confirmDel, setConfirmDel] = useState(false);
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
-  const txs = transactions.filter(t => t.envelopeId === env.id).slice(0,10);
   const risk = promoRisk(env);
   const variance = scheduleVariance(env);
   const due = nextDueDate(env);
@@ -2034,22 +2207,7 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
         </>
       )}
 
-      {txs.length > 0 && (
-        <>
-          <Label style={{marginTop:14}}>Recent payments</Label>
-          <div className="grp" style={{marginBottom:12}}>
-            {txs.map(t=>(
-              <div key={t.id} className="row" style={{padding:"11px 14px"}}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:14,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.desc}</div>
-                  <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>{t.date}</div>
-                </div>
-                <div style={{fontSize:14,fontWeight:600,color:"#aeaeb2"}}>−{money(t.amount)}</div>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
+      <EnvelopeTransactions env={env} transactions={transactions} />
 
       <div style={{display:"flex",gap:8,marginTop:6}}>
         <button className="btn-dim" style={{flex:1}} onClick={onEdit}>Edit</button>
@@ -2106,12 +2264,25 @@ function FundSheet({ env, sts, transactions, onFund, onUnfund, onClose }) {
 
 function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
   const [remember, setRemember] = useState(true);
+  const isCredit = tx.amount <= 0;
   return (
-    <Sheet onClose={onClose} title="Where does this go?">
+    <Sheet onClose={onClose} title={isCredit ? "Money came back — where from?" : "Where does this go?"}>
       <div className="card" style={{padding:14,marginBottom:14}}>
         <div style={{fontSize:15,fontWeight:600,marginBottom:3}}>{tx.desc}</div>
-        <div style={{fontSize:13,color:"#8e8e93"}}>{money(tx.amount)} · {tx.date}</div>
+        <div style={{fontSize:13,color:isCredit?"#30d158":"#8e8e93"}}>
+          {isCredit ? `+${money(Math.abs(tx.amount))}` : money(tx.amount)} · {tx.date}
+        </div>
       </div>
+
+      {isCredit && (
+        <div className="card" style={{padding:13,marginBottom:14,border:"1px solid #30d15833"}}>
+          <div style={{fontSize:12.5,color:"#8e8e93",lineHeight:1.55}}>
+            Assign this to an envelope and it counts as a <strong style={{color:"#30d158"}}>refund</strong> —
+            it'll subtract from what you've spent there. Skip it and it's treated as
+            <strong style={{color:"#fff"}}> income</strong>, which only affects your checking balance.
+          </div>
+        </div>
+      )}
       <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:14}}>
         {envelopes.map(env=>(
           <button key={env.id} onClick={()=>onAssign(tx, env.id, remember)}
@@ -2135,7 +2306,9 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
           <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>Teach it once, never sort this bill again</div>
         </div>
       </button>
-      <button className="btn-dim" onClick={onSkip} style={{color:"#8e8e93"}}>Skip — not a budget item</button>
+      <button className="btn-dim" onClick={onSkip} style={{color:"#8e8e93"}}>
+        {isCredit ? "It's income — not a refund" : "Skip — not a budget item"}
+      </button>
     </Sheet>
   );
 }

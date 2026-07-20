@@ -325,17 +325,25 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null) {
 }
 
 // ── Spending envelopes: how much of this month's budget is gone? ─────────────
+// What a spending envelope has actually cost you this month.
+//
+// This nets refunds. A credit only lands here if you assigned it to this
+// envelope — and assigning it is you saying "this money came back from
+// something I spent here." An unassigned credit (a paycheck, an Uber payout)
+// never reaches this function, so income can't quietly deflate your spending.
+//
+// Bills deliberately don't net: "did a payment post this period" is a yes/no
+// question, and a refund shouldn't un-pay a bill.
 export function spentThisMonth(env, transactions) {
   const now = new Date();
   const m = now.getMonth(), y = now.getFullYear();
   return transactions
     .filter(t => t.envelopeId === env.id)
-    .filter(t => t.amount > 0)   // outflows only; a refund shouldn't inflate spending
     .filter(t => {
       const d = new Date(t.date + "T00:00:00");
       return d.getMonth() === m && d.getFullYear() === y;
     })
-    .reduce((s, t) => s + t.amount, 0);
+    .reduce((s, t) => s + t.amount, 0);   // outflows +, refunds −
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
