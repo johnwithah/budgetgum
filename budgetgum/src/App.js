@@ -5,6 +5,7 @@ import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
+  billAmountStats, amountDrift,
   safeToSpend, shortfall, upcomingLocks, buildAlerts,
   matchEnvelope, normalizeMerchant,
   money, daysBetween, DOW,
@@ -218,16 +219,32 @@ export default function App() {
       const recorded = [...matched, ...deposits];
 
       // One atomic state update — keeps the server write consistent.
-      setState(s => ({
-        ...s,
-        accounts: d.accounts || [],
-        transactions: recorded.length ? [...recorded, ...s.transactions] : s.transactions,
-        envelopes: matched.length
+      setState(s => {
+        const allTx = recorded.length ? [...recorded, ...s.transactions] : s.transactions;
+        let nextEnvelopes = matched.length
           ? s.envelopes.map(env => applyPayments(env, matched.filter(t => t.envelopeId === env.id)))
-          : s.envelopes,
-        unmapped: needsAssign.length ? [...needsAssign, ...s.unmapped] : s.unmapped,
-        lastSync: new Date().toISOString(),
-      }));
+          : s.envelopes;
+
+        // Variable bills with auto-update on re-learn their reserve amount from
+        // the payment that just cleared. Computed against the full transaction
+        // list so the new payment is included.
+        nextEnvelopes = nextEnvelopes.map(env => {
+          if (!env.autoAmount || env.type !== TYPES.RECURRING) return env;
+          const stats = billAmountStats(env, allTx);
+          if (!stats || !stats.enough) return env;
+          if (Math.abs(stats.suggested - (env.billAmount || 0)) < 0.01) return env;
+          return { ...env, billAmount: stats.suggested };
+        });
+
+        return {
+          ...s,
+          accounts: d.accounts || [],
+          transactions: allTx,
+          envelopes: nextEnvelopes,
+          unmapped: needsAssign.length ? [...needsAssign, ...s.unmapped] : s.unmapped,
+          lastSync: new Date().toISOString(),
+        };
+      });
 
       const inflowNote = deposits.length ? `, ${deposits.length} deposit${deposits.length>1?"s":""}` : "";
       showToast(`Synced — ${fresh.length} new${inflowNote}`);
@@ -364,24 +381,45 @@ export default function App() {
 
   function assignTx(tx, envId, remember) {
     const assigned = { ...tx, envelopeId: envId };
-    setState(s => ({
-      ...s,
-      transactions: [assigned, ...s.transactions],
-      unmapped: s.unmapped.filter(t => t.id !== tx.id),
-      envelopes: s.envelopes.map(e => {
-        if (e.id !== envId) return e;
-        let next = applyPayments(e, [assigned]);
-        if (remember) {
-          const pattern = normalizeMerchant(tx.desc);
-          if (pattern && !(next.matchPatterns||[]).includes(pattern)) {
-            next.matchPatterns = [...(next.matchPatterns||[]), pattern];
+    setState(s => {
+      const allTx = [assigned, ...s.transactions];
+      return {
+        ...s,
+        transactions: allTx,
+        unmapped: s.unmapped.filter(t => t.id !== tx.id),
+        envelopes: s.envelopes.map(e => {
+          if (e.id !== envId) return e;
+          let next = applyPayments(e, [assigned]);
+          if (remember) {
+            const pattern = normalizeMerchant(tx.desc);
+            if (pattern && !(next.matchPatterns||[]).includes(pattern)) {
+              next.matchPatterns = [...(next.matchPatterns||[]), pattern];
+            }
           }
-        }
-        return next;
-      }),
-    }));
+          // Re-learn the reserve amount if this bill tracks itself.
+          if (next.autoAmount && next.type === TYPES.RECURRING) {
+            const stats = billAmountStats(next, allTx);
+            if (stats && stats.enough) next = { ...next, billAmount: stats.suggested };
+          }
+          return next;
+        }),
+      };
+    });
     setMapTx(null);
     showToast(remember ? "Assigned — will auto-match next time" : "Assigned");
+  }
+
+  // Adopt the learned amount for a variable bill.
+  function updateBillAmount(env, amount) {
+    setEnvelopes(p => p.map(e => e.id === env.id ? { ...e, billAmount: amount } : e));
+    showToast(`Updated to ${money(amount)}`);
+  }
+
+  // When on, the reserve amount re-learns itself each time a payment clears.
+  function toggleAutoAmount(env) {
+    const on = !env.autoAmount;
+    setEnvelopes(p => p.map(e => e.id === env.id ? { ...e, autoAmount: on } : e));
+    showToast(on ? "Will keep itself updated" : "Auto-update off");
   }
 
   function markPaid(env) {
@@ -752,7 +790,9 @@ export default function App() {
                       onFund={()=>{ setFundEnv(detailEnv); setDetailEnv(null); }}
                       onMarkPaid={()=>markPaid(detailEnv)}
                       onMarkPeriodPaid={markPeriodPaid}
-                      onUnmarkPeriod={unmarkPaid} />}
+                      onUnmarkPeriod={unmarkPaid}
+                      onUpdateAmount={updateBillAmount}
+                      onToggleAutoAmount={toggleAutoAmount} />}
       {fundEnv   && <FundSheet env={envelopes.find(e=>e.id===fundEnv.id)} sts={sts} transactions={transactions}
                       onFund={a=>{fund(fundEnv.id,a); setFundEnv(null);}}
                       onUnfund={a=>{unfund(fundEnv.id,a); setFundEnv(null);}}
@@ -1513,7 +1553,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod }) {
+function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod, onUpdateAmount, onToggleAutoAmount }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
@@ -1615,6 +1655,62 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
 
       {isBill(env.type) && (
         <>
+      {/* What this bill actually costs — learned from real payments */}
+      {env.type === TYPES.RECURRING && (() => {
+        const stats = billAmountStats(env, transactions);
+        if (!stats || !stats.enough) return null;
+        const drift = amountDrift(env, transactions);
+        return (
+          <>
+            <Label style={{marginTop:14}}>What it actually costs</Label>
+            <div className="card" style={{padding:14,marginBottom:12,border:drift?"1px solid #ffd60a33":"1px solid transparent"}}>
+              <div style={{display:"flex",gap:14}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>Average</div>
+                  <div style={{fontSize:16,fontWeight:700,letterSpacing:"-.4px"}}>{money(stats.avg)}</div>
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>{stats.variable?"Range":"Latest"}</div>
+                  <div style={{fontSize:16,fontWeight:700,letterSpacing:"-.4px"}}>
+                    {stats.variable ? `${money(stats.min)}–${money(stats.max)}` : money(stats.latest)}
+                  </div>
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>Payments</div>
+                  <div style={{fontSize:16,fontWeight:700,letterSpacing:"-.4px"}}>{stats.count}</div>
+                </div>
+              </div>
+
+              {drift && (
+                <div style={{marginTop:12,paddingTop:12,borderTop:".5px solid rgba(255,255,255,.08)"}}>
+                  <div style={{fontSize:12.5,color:"#ffd60a",lineHeight:1.5,marginBottom:10}}>
+                    {drift.under
+                      ? `You're reserving ${money(drift.current)}, but recent charges run higher. ${money(drift.suggested)} would cover ${stats.variable?"the swings":"it"}.`
+                      : `You're reserving ${money(drift.current)} — more than this bill has cost lately. ${money(drift.suggested)} would be enough.`}
+                  </div>
+                  <button className="btn-mini" style={{background:"#c5f135",color:"#000",width:"100%"}}
+                    onClick={()=>onUpdateAmount(env, drift.suggested)}>
+                    Update to {money(drift.suggested)}
+                  </button>
+                </div>
+              )}
+
+              {stats.variable && (
+                <button onClick={()=>onToggleAutoAmount(env)}
+                  style={{background:"#2c2c2e",border:"none",borderRadius:11,padding:"11px 13px",width:"100%",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",marginTop:10}}>
+                  <div style={{width:20,height:20,borderRadius:6,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,color:"#000",
+                    background:env.autoAmount?"#c5f135":"#48484a"}}>{env.autoAmount?"✓":""}</div>
+                  <div style={{flex:1,textAlign:"left"}}>
+                    <div style={{fontSize:13,fontWeight:500,color:"#fff"}}>Keep this amount up to date</div>
+                    <div style={{fontSize:11,color:"#8e8e93",marginTop:1}}>Adjusts on its own as new payments clear</div>
+                  </div>
+                </button>
+              )}
+            </div>
+          </>
+        );
+      })()}
+
           <Label style={{marginTop:14}}>Payment history</Label>
           <div className="grp" style={{marginBottom:12}}>
             {paymentHistory(env, transactions, 6, dataSince).map(p => (

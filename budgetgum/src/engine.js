@@ -315,6 +315,77 @@ export function daysUntilLock(env) {
 }
 
 // ── What does this envelope want this period? ────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// LEARNING WHAT A BILL ACTUALLY COSTS
+//
+// Electric, water, rent-with-fees — these move every month, so the amount you
+// typed when you created the envelope goes stale immediately. But we have the
+// real payment history, so we can just... look.
+//
+// The suggestion deliberately errs HIGH. Over-reserving costs nothing — the
+// money isn't spent, just briefly parked, and it returns to Safe to Spend the
+// moment the real charge clears. Under-reserving is what actually hurts: it
+// quietly overstates what's safe to spend, and on an autopay bill it means the
+// lock sets aside too little.
+// ═════════════════════════════════════════════════════════════════════════════
+export function billAmountStats(env, transactions, lookback = 6) {
+  if (!isBill(env.type)) return null;
+
+  // One total per billing period — a bill split across two payments in the same
+  // period should count as its combined amount, not two smaller ones.
+  const periods = paymentHistory(env, transactions, lookback)
+    .filter(p => p.amount > 0)
+    .map(p => p.amount);
+
+  if (periods.length < 2) {
+    return { count: periods.length, enough: false };
+  }
+
+  const avg = periods.reduce((s, n) => s + n, 0) / periods.length;
+  const min = Math.min(...periods);
+  const max = Math.max(...periods);
+  const latest = periods[0];             // history is most-recent-first
+  const spread = avg > 0 ? (max - min) / avg : 0;
+
+  // A bill that changed once and then held steady (a price increase) is NOT
+  // variable — it's stable at a new price. Only call it variable if the recent
+  // charges actually disagree with each other.
+  const settled = periods.length >= 2 && Math.abs(periods[0] - periods[1]) < 0.01;
+  const variable = !settled && spread > 0.08;
+
+  // Stable → follow the latest actual charge exactly.
+  // Variable → cover the worst recent month with a little headroom.
+  let suggested;
+  if (variable) {
+    const raw = Math.max(max * 1.05, avg * 1.15);
+    // Round up to the nearest $5, but only on bills big enough for that to make
+    // sense — rounding a $18 bill to $20 is noise, not prudence.
+    suggested = raw >= 50 ? Math.ceil(raw / 5) * 5 : Math.ceil(raw);
+  } else {
+    suggested = Math.ceil(latest * 100) / 100;
+  }
+
+  return {
+    count: periods.length,
+    enough: true,
+    avg: Math.round(avg * 100) / 100,
+    min, max, latest, variable, suggested,
+  };
+}
+
+// Is the stored amount meaningfully out of step with reality?
+// Returns null when there's nothing worth saying.
+export function amountDrift(env, transactions) {
+  const stats = billAmountStats(env, transactions);
+  if (!stats || !stats.enough) return null;
+  const current = env.type === TYPES.RECURRING ? (env.billAmount || 0) : 0;
+  if (!current) return null;
+  const diff = stats.suggested - current;
+  // Ignore trivial differences — no one needs a nag over 40 cents.
+  if (Math.abs(diff) < Math.max(1, current * 0.05)) return null;
+  return { ...stats, current, diff, under: diff > 0 };
+}
+
 export function targetAmount(env) {
   switch (env.type) {
     case TYPES.SPENDING:  return env.monthlyBudget || 0;
