@@ -768,6 +768,154 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
 // — and they LEARN. When you manually assign a transaction, we offer to
 // remember the merchant. You train each bill once, then it's silent forever.
 
+// ═════════════════════════════════════════════════════════════════════════════
+// INCOME
+//
+// Income here is simply: a credit that isn't attached to an envelope. If you
+// assigned it, you called it a refund. If you didn't, it's money that came in.
+// That one distinction does all the work — no classifier, no guessing.
+//
+// This matters more for variable income than for salary. "What did I earn in
+// July" is a question a salaried person never has to ask and a rideshare driver
+// asks constantly, so the numbers here lean toward answering it honestly: what
+// actually landed, what it's averaging, and how uneven it's been.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Plaid signs inflows negative; income is reported positive.
+const inflowAmount = t => Math.abs(t.amount);
+
+export function incomeTransactions(transactions) {
+  return transactions
+    .filter(t => t.amount < 0 && !t.envelopeId)
+    .slice()
+    .sort((a, b) => (a.date < b.date ? 1 : -1));
+}
+
+function monthKeyOf(dateStr) {
+  return (dateStr || "").slice(0, 7);   // YYYY-MM
+}
+
+// Total income per calendar month, most recent first.
+export function incomeByMonth(transactions, count = 6) {
+  const income = incomeTransactions(transactions);
+  const totals = new Map();
+  income.forEach(t => {
+    const k = monthKeyOf(t.date);
+    if (!k) return;
+    totals.set(k, (totals.get(k) || 0) + inflowAmount(t));
+  });
+
+  // Walk backwards from the current month so gaps show as $0 rather than
+  // silently collapsing — a month you earned nothing is information.
+  const out = [];
+  const now = new Date();
+  for (let i = 0; i < count; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    out.push({
+      key: k,
+      label: d.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
+      shortLabel: d.toLocaleDateString("en-US", { month: "short" }),
+      total: totals.get(k) || 0,
+      isCurrent: i === 0,
+    });
+  }
+  return out;
+}
+
+// Where the money came from, for one month (or all time if monthKey is null).
+export function incomeBySource(transactions, monthKey = null) {
+  const income = incomeTransactions(transactions)
+    .filter(t => !monthKey || monthKeyOf(t.date) === monthKey);
+
+  const groups = new Map();
+  income.forEach(t => {
+    // Group by normalized merchant so "UBER PAYMENT 4471" and
+    // "UBER PAYMENT 9982" land together.
+    const key = normalizeMerchant(t.desc) || "other";
+    if (!groups.has(key)) {
+      // Display the cleaned-up group name rather than whichever raw description
+      // happened to arrive first — "Uber", not "UBER   PAYMENT 4471".
+      const name = key === "other"
+        ? (t.desc || "Other")
+        : key.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+      groups.set(key, { key, name, total: 0, count: 0 });
+    }
+    const g = groups.get(key);
+    g.total += inflowAmount(t);
+    g.count += 1;
+  });
+
+  return [...groups.values()].sort((a, b) => b.total - a.total);
+}
+
+// Income grouped into weeks, which is the rhythm most gig platforms pay on.
+export function incomeByWeek(transactions, weeks = 8) {
+  const income = incomeTransactions(transactions);
+  const today = startOfDay();
+
+  // Anchor to the most recent Sunday so weeks line up consistently.
+  const thisWeekStart = new Date(today);
+  thisWeekStart.setDate(today.getDate() - today.getDay());
+
+  const out = [];
+  for (let i = 0; i < weeks; i++) {
+    const start = new Date(thisWeekStart);
+    start.setDate(thisWeekStart.getDate() - i * 7);
+    const end = new Date(start);
+    end.setDate(start.getDate() + 7);
+
+    const total = income
+      .filter(t => {
+        const d = startOfDay(new Date(t.date + "T00:00:00"));
+        return d >= startOfDay(start) && d < startOfDay(end);
+      })
+      .reduce((s, t) => s + inflowAmount(t), 0);
+
+    out.push({
+      start: startOfDay(start),
+      label: start.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      total,
+      isCurrent: i === 0,
+    });
+  }
+  return out;
+}
+
+// Headline numbers. Averages deliberately exclude the current (partial) month
+// and week — comparing a half-finished July against complete months would
+// understate every time you looked at it.
+export function incomeStats(transactions) {
+  const months = incomeByMonth(transactions, 7);
+  const weeks = incomeByWeek(transactions, 9);
+
+  const thisMonth = months[0]?.total || 0;
+  const lastMonth = months[1]?.total || 0;
+
+  const completeMonths = months.slice(1).filter(m => m.total > 0);
+  const avgMonth = completeMonths.length
+    ? completeMonths.reduce((s, m) => s + m.total, 0) / completeMonths.length
+    : 0;
+
+  const completeWeeks = weeks.slice(1).filter(w => w.total > 0);
+  const avgWeek = completeWeeks.length
+    ? completeWeeks.reduce((s, w) => s + w.total, 0) / completeWeeks.length
+    : 0;
+  const bestWeek = completeWeeks.length ? Math.max(...completeWeeks.map(w => w.total)) : 0;
+  const leanWeek = completeWeeks.length ? Math.min(...completeWeeks.map(w => w.total)) : 0;
+
+  return {
+    thisMonth, lastMonth, avgMonth,
+    thisWeek: weeks[0]?.total || 0,
+    avgWeek, bestWeek, leanWeek,
+    monthsTracked: completeMonths.length,
+    weeksTracked: completeWeeks.length,
+    // How uneven the weeks are — the number that actually matters when income
+    // varies and bills don't.
+    swing: avgWeek > 0 ? (bestWeek - leanWeek) / avgWeek : 0,
+  };
+}
+
 export function normalizeMerchant(desc) {
   return (desc || "")
     .toLowerCase()

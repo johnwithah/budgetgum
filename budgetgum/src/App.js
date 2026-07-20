@@ -8,6 +8,7 @@ import {
   billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
+  incomeByMonth, incomeBySource, incomeByWeek, incomeStats, incomeTransactions,
   money, daysBetween, DOW,
 } from "./engine";
 
@@ -110,6 +111,7 @@ export default function App() {
   const [fundEnv, setFundEnv] = useState(null);
   const [mapTx, setMapTx] = useState(null);
   const [txDetail, setTxDetail] = useState(null);   // a sorted transaction being viewed/edited
+  const [activityView, setActivityView] = useState("all");   // all | income
   const [settings, setSettings] = useState(false);
 
   const checkingBalance = useMemo(
@@ -865,10 +867,23 @@ export default function App() {
       {tab === "activity" && (
         <div style={S.page}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-            <div className="sec" style={{margin:0}}>Transactions</div>
+            <div className="sec" style={{margin:0}}>{activityView==="income"?"Income":"Transactions"}</div>
             {bankConnected && <button className="link" onClick={syncBank} disabled={syncing} style={{color:syncing?"#48484a":"#0a84ff",fontSize:15}}>{syncing?"Syncing…":"↻ Sync"}</button>}
           </div>
-          {transactions.length === 0 ? (
+
+          <div style={{display:"flex",gap:6,background:"#1c1c1e",borderRadius:11,padding:4,marginBottom:16}}>
+            {[["all","All"],["income","Income"]].map(([v,label])=>(
+              <button key={v} onClick={()=>setActivityView(v)}
+                style={{flex:1,background:activityView===v?"#2c2c2e":"transparent",color:activityView===v?"#fff":"#8e8e93",
+                        border:"none",borderRadius:8,padding:"8px 0",fontSize:13.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {activityView === "income" ? (
+            <IncomeView transactions={transactions} onOpenTx={tx=>setTxDetail(tx)} />
+          ) : transactions.length === 0 ? (
             <div className="card" style={{padding:28,textAlign:"center",color:"#636366",fontSize:14}}>
               No transactions yet. Connect your bank and sync.
             </div>
@@ -1109,6 +1124,171 @@ function EnvelopeTransactions({ env, transactions }) {
               onClick={()=>setShowEarlier(false)}>Hide earlier</button>
           </>
         )
+      )}
+    </>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INCOME VIEW — what actually landed.
+//
+// Built for variable income specifically. A salaried person needs one number;
+// someone driving needs to know the shape: what's typical, how wide the swing
+// is, and whether this month is tracking ahead or behind. The averages exclude
+// the current partial month and week, because comparing a half-finished July
+// against complete months would understate every single time you looked.
+// ═════════════════════════════════════════════════════════════════════════════
+function IncomeView({ transactions, onOpenTx }) {
+  const [monthKey, setMonthKey] = useState(null);   // null = current month
+
+  const months = useMemo(() => incomeByMonth(transactions, 6), [transactions]);
+  const weeks  = useMemo(() => incomeByWeek(transactions, 8), [transactions]);
+  const stats  = useMemo(() => incomeStats(transactions), [transactions]);
+  const income = useMemo(() => incomeTransactions(transactions), [transactions]);
+
+  const activeKey = monthKey || months[0]?.key;
+  const activeMonth = months.find(m => m.key === activeKey) || months[0];
+  const sources = useMemo(() => incomeBySource(transactions, activeKey), [transactions, activeKey]);
+  const monthTx = income.filter(t => (t.date || "").slice(0,7) === activeKey);
+
+  if (!income.length) {
+    return (
+      <div className="card" style={{padding:28,textAlign:"center"}}>
+        <div style={{fontSize:34,marginBottom:10}}>⬇</div>
+        <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No income recorded yet</div>
+        <div style={{fontSize:13,color:"#636366",lineHeight:1.55}}>
+          Deposits you don't assign to an envelope land here. Sync your bank and any
+          payouts will start showing up.
+        </div>
+      </div>
+    );
+  }
+
+  const maxMonth = Math.max(...months.map(m => m.total), 1);
+  const maxWeek  = Math.max(...weeks.map(w => w.total), 1);
+
+  return (
+    <>
+      {/* Headline */}
+      <div className="card" style={{padding:"18px 18px 16px",marginBottom:14}}>
+        <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:600,textTransform:"uppercase",letterSpacing:".5px"}}>
+          Earned in {activeMonth?.label.split(" ")[0]}
+        </div>
+        <div style={{fontSize:38,fontWeight:700,letterSpacing:"-1.8px",color:"#30d158",lineHeight:1.1,marginTop:3}}>
+          {money(activeMonth?.total || 0)}
+        </div>
+        {stats.monthsTracked > 0 && activeMonth?.isCurrent && (
+          <div style={{fontSize:12.5,color:"#8e8e93",marginTop:5,lineHeight:1.5}}>
+            {stats.thisMonth >= stats.avgMonth
+              ? `${money(stats.thisMonth - stats.avgMonth)} above your ${money(stats.avgMonth)} average`
+              : `${money(stats.avgMonth - stats.thisMonth)} below your ${money(stats.avgMonth)} average — month may not be done`}
+          </div>
+        )}
+      </div>
+
+      {/* Month bars — tap to switch */}
+      <div className="card" style={{padding:16,marginBottom:14}}>
+        <div style={{fontSize:12.5,fontWeight:600,color:"#8e8e93",marginBottom:14}}>By month</div>
+        <div style={{display:"flex",alignItems:"flex-end",gap:8,height:96}}>
+          {months.slice().reverse().map(m => {
+            const on = m.key === activeKey;
+            const h = Math.max(3, (m.total / maxMonth) * 76);
+            return (
+              <button key={m.key} onClick={()=>setMonthKey(m.key)}
+                style={{flex:1,background:"none",border:"none",padding:0,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:6,height:"100%",justifyContent:"flex-end"}}>
+                <div style={{fontSize:9.5,color:on?"#30d158":"#48484a",fontWeight:600}}>
+                  {m.total>0 ? Math.round(m.total) : ""}
+                </div>
+                <div style={{width:"100%",height:h,borderRadius:5,
+                  background:on?"linear-gradient(180deg,#30d158,#1f8f3c)":"#2c2c2e"}}/>
+                <div style={{fontSize:10,color:on?"#fff":"#636366",fontWeight:on?600:400}}>{m.shortLabel}</div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Where it came from */}
+      {sources.length > 0 && (
+        <>
+          <div className="sec">Sources · {activeMonth?.label}</div>
+          <div className="grp" style={{marginBottom:14}}>
+            {sources.map(s => {
+              const pct = activeMonth?.total > 0 ? (s.total / activeMonth.total) * 100 : 0;
+              return (
+                <div key={s.key} className="row" style={{padding:"12px 14px",flexDirection:"column",alignItems:"stretch",gap:7}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:14.5,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}</div>
+                      <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>{s.count} deposit{s.count===1?"":"s"} · {Math.round(pct)}%</div>
+                    </div>
+                    <div style={{fontSize:15,fontWeight:700,color:"#30d158",letterSpacing:"-.3px"}}>{money(s.total)}</div>
+                  </div>
+                  <div className="bar"><div className="fill" style={{width:`${pct}%`,background:"#30d158"}}/></div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {/* Weekly rhythm — the number that matters when income varies */}
+      {stats.weeksTracked >= 2 && (
+        <>
+          <div className="sec">Weekly rhythm</div>
+          <div className="card" style={{padding:16,marginBottom:14}}>
+            <div style={{display:"flex",gap:14,marginBottom:14}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>Typical week</div>
+                <div style={{fontSize:17,fontWeight:700,letterSpacing:"-.4px"}}>{money(stats.avgWeek)}</div>
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>Best</div>
+                <div style={{fontSize:17,fontWeight:700,color:"#30d158",letterSpacing:"-.4px"}}>{money(stats.bestWeek)}</div>
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:11,color:"#8e8e93",marginBottom:2}}>Leanest</div>
+                <div style={{fontSize:17,fontWeight:700,color:"#ff9f0a",letterSpacing:"-.4px"}}>{money(stats.leanWeek)}</div>
+              </div>
+            </div>
+            <div style={{display:"flex",alignItems:"flex-end",gap:5,height:52,marginBottom:10}}>
+              {weeks.slice().reverse().map((w,i) => (
+                <div key={i} style={{flex:1,height:Math.max(3,(w.total/maxWeek)*48),borderRadius:4,
+                  background:w.isCurrent?"#30d158":"#2c2c2e"}} title={`${w.label}: ${money(w.total)}`}/>
+              ))}
+            </div>
+            {stats.swing > 0.6 && (
+              <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.55,paddingTop:10,borderTop:".5px solid rgba(255,255,255,.07)"}}>
+                Your weeks swing a lot — best to leanest is a {money(stats.bestWeek - stats.leanWeek)} spread.
+                Funding bills off a lean week rather than a good one is the safer habit.
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* The deposits themselves */}
+      <div className="sec">Deposits · {activeMonth?.label}</div>
+      {monthTx.length === 0 ? (
+        <div className="card" style={{padding:20,textAlign:"center",fontSize:13,color:"#636366"}}>
+          Nothing recorded this month.
+        </div>
+      ) : (
+        <div className="grp">
+          {monthTx.map(t => (
+            <button key={t.id} className="row row-tap" onClick={()=>onOpenTx(t)}
+              style={{width:"100%",textAlign:"left",background:"none",border:"none",fontFamily:"inherit",color:"#fff"}}>
+              <div className="ibox" style={{background:"#30d15822",color:"#30d158"}}>⬇</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14.5,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.desc}</div>
+                <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>
+                  {new Date(t.date+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
+                </div>
+              </div>
+              <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>+{money(Math.abs(t.amount))}</div>
+            </button>
+          ))}
+        </div>
       )}
     </>
   );
