@@ -745,6 +745,7 @@ export default function App() {
       {editEnv   && <EnvelopeForm initial={editEnv} onSave={saveEnvelope} onCancel={()=>setEditEnv(null)} />}
       {detailEnv && <EnvelopeDetail env={envelopes.find(e=>e.id===detailEnv.id) || detailEnv}
                       transactions={transactions}
+                      dataSince={state.importSince || "2026-07-14"}
                       onClose={()=>setDetailEnv(null)}
                       onEdit={()=>{ setEditEnv(detailEnv); setDetailEnv(null); }}
                       onDelete={()=>deleteEnvelope(detailEnv.id)}
@@ -1512,7 +1513,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod }) {
+function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
@@ -1616,18 +1617,20 @@ function EnvelopeDetail({ env, transactions, onClose, onEdit, onDelete, onFund, 
         <>
           <Label style={{marginTop:14}}>Payment history</Label>
           <div className="grp" style={{marginBottom:12}}>
-            {paymentHistory(env, transactions, 6).map(p => (
+            {paymentHistory(env, transactions, 6, dataSince).map(p => (
               <div key={p.key} className="row" style={{padding:"11px 14px"}}>
                 <div style={{width:26,height:26,borderRadius:8,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,
-                  background:p.upcoming?"#2c2c2e":p.paid?"#30d15826":"#ff375f26",
-                  color:p.upcoming?"#8e8e93":p.paid?"#30d158":"#ff375f"}}>
-                  {p.upcoming?"•":p.paid?"✓":"!"}
+                  background:p.paid?"#30d15826":p.noData?"#2c2c2e":p.missed?"#ff375f26":"#2c2c2e",
+                  color:p.paid?"#30d158":p.noData?"#48484a":p.missed?"#ff375f":"#8e8e93"}}>
+                  {p.paid?"✓":p.noData?"–":p.missed?"!":"•"}
                 </div>
                 <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:14,fontWeight:500}}>{p.label}</div>
+                  <div style={{fontSize:14,fontWeight:500,color:p.noData?"#8e8e93":"#fff"}}>{p.label}</div>
                   <div style={{fontSize:11.5,color:p.missed?"#ff375f":"#636366",marginTop:1}}>
-                    {p.upcoming ? "Upcoming"
-                      : p.paid ? (p.manual && p.amount<=0 ? "Marked paid" : `Paid${p.paidDate?` ${new Date(p.paidDate+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}`:""}`)
+                    {p.paid
+                      ? (p.manual && p.amount<=0 ? "Marked paid" : `Paid${p.paidDate?` ${new Date(p.paidDate+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}`:""}`)
+                      : p.noData ? "Before your import date"
+                      : p.upcoming ? "Upcoming"
                       : "Missed — no payment found"}
                   </div>
                 </div>

@@ -94,12 +94,7 @@ export function nextDueDate(env, from = new Date()) {
   return d;
 }
 
-// The current billing period runs from one due date to the next. A payment
-// "counts" for this period if it falls inside that window.
-//
-// This is what makes the ✓ self-clearing: once the due date passes, `nextDue`
-// rolls forward, the window slides with it, and last month's payment falls out
-// of range. You never uncheck anything.
+// The current billing period runs from one due date to the next.
 export function periodStart(env, from = new Date()) {
   const next = nextDueDate(env, from);
   if (!next) return null;
@@ -117,18 +112,49 @@ export function txForEnvelope(env, transactions) {
   return transactions.filter(t => t.envelopeId === env.id);
 }
 
-// Total paid within the current billing period.
+// ═════════════════════════════════════════════════════════════════════════════
+// PAYMENT ATTRIBUTION
+//
+// Which bill is this payment FOR? A naive "is it between these two dates"
+// window gets this wrong in both directions:
+//
+//   • Pay ON the due date → an exclusive end bracket excludes it entirely.
+//     (This is the most common way people pay, and it was showing as unpaid.)
+//   • Pay a day or two late → it lands past the due date, so the window has
+//     already rolled forward and it counts toward NEXT month instead.
+//
+// So instead of asking "is this payment inside the window," we ask "which due
+// date is this payment for?" — the first due date on or after (payment date
+// minus a few days' grace). One payment maps to exactly one period, early and
+// slightly-late payments both land on the right bill, and nothing double-counts.
+// ═════════════════════════════════════════════════════════════════════════════
+export const GRACE_DAYS = 4;
+
+export function addDays(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return startOfDay(d);
+}
+
+// The due date this payment should be credited to.
+export function periodDueFor(env, dateStr) {
+  const paid = startOfDay(new Date(dateStr + "T00:00:00"));
+  if (isNaN(paid.getTime())) return null;
+  // Shift back by the grace window, then snap forward to the next due date.
+  // Paying up to GRACE_DAYS late still credits the due date just passed.
+  return nextDueDate(env, addDays(paid, -GRACE_DAYS));
+}
+
+const keyOf = d => (d ? d.toISOString().split("T")[0] : "");
+
+// Total credited to the current billing period.
 export function paidThisPeriod(env, transactions) {
   if (!isBill(env.type)) return 0;
-  const start = periodStart(env);
-  const end = nextDueDate(env);
+  const current = periodKey(env);
   return transactions
     .filter(t => t.envelopeId === env.id)
     .filter(t => t.amount > 0)   // outflows only; ignore refunds/inflows
-    .filter(t => {
-      const d = startOfDay(new Date(t.date + "T00:00:00"));
-      return d >= start && d < end;
-    })
+    .filter(t => keyOf(periodDueFor(env, t.date)) === current)
     .reduce((s, t) => s + t.amount, 0);
 }
 
@@ -181,7 +207,7 @@ export function prevDueDate(env, due) {
 // manual, missed }]. `missed` = a past period with no payment and no manual
 // confirmation — the one state that deserves attention.
 // ═════════════════════════════════════════════════════════════════════════════
-export function paymentHistory(env, transactions, count = 6) {
+export function paymentHistory(env, transactions, count = 6, dataSince = null) {
   if (!isBill(env.type)) return [];
   const today = startOfDay();
   const manualSet = new Set([
@@ -189,28 +215,34 @@ export function paymentHistory(env, transactions, count = 6) {
     ...(env.manualPaidPeriod ? [env.manualPaidPeriod] : []),   // legacy
   ]);
 
+  // Pre-bucket every payment by the due date it's credited to, so early and
+  // slightly-late payments land on the right period.
+  const byPeriod = new Map();
+  transactions
+    .filter(t => t.envelopeId === env.id && t.amount > 0)
+    .forEach(t => {
+      const k = keyOf(periodDueFor(env, t.date));
+      if (!k) return;
+      if (!byPeriod.has(k)) byPeriod.set(k, []);
+      byPeriod.get(k).push(t);
+    });
+
+  // Periods before this date are ones the app has no transaction data for —
+  // reporting them as "missed" would be a false alarm.
+  const floor = dataSince ? startOfDay(new Date(dataSince + "T00:00:00")) : null;
+
   const out = [];
   let due = nextDueDate(env);
   for (let i = 0; i < count && due; i++) {
-    const windowStart = prevDueDate(env, due);
-    const windowEnd = due;
-    const key = due.toISOString().split("T")[0];
-
-    const inWindow = transactions
-      .filter(t => t.envelopeId === env.id && t.amount > 0)
-      .filter(t => {
-        const d = startOfDay(new Date(t.date + "T00:00:00"));
-        return d >= windowStart && d < windowEnd;
-      });
-
-    const amount = inWindow.reduce((s, t) => s + t.amount, 0);
-    const paidDate = inWindow.length
-      ? inWindow.map(t => t.date).sort().slice(-1)[0]
-      : null;
+    const key = keyOf(due);
+    const hits = byPeriod.get(key) || [];
+    const amount = hits.reduce((s, t) => s + t.amount, 0);
+    const paidDate = hits.length ? hits.map(t => t.date).sort().slice(-1)[0] : null;
 
     const manual = manualSet.has(key);
     const paid = amount > 0 || manual;
-    const isPast = windowEnd <= today;   // due date has passed
+    const isPast = due < today;                    // due date has passed
+    const noData = Boolean(floor && due < floor);  // predates our data
 
     out.push({
       key,
@@ -221,7 +253,8 @@ export function paymentHistory(env, transactions, count = 6) {
       amount,
       paidDate,
       manual,
-      missed: isPast && !paid,
+      noData,
+      missed: isPast && !paid && !noData,
       upcoming: !isPast,
     });
 
