@@ -236,6 +236,15 @@ export default function App() {
           return { ...env, billAmount: stats.suggested };
         });
 
+        // Adopt merchant branding from Plaid the first time we see it. Only
+        // fills empty fields — anything you set by hand is never overwritten.
+        nextEnvelopes = nextEnvelopes.map(env => {
+          if (env.logoUrl || env.website) return env;
+          const hit = matched.find(t => t.envelopeId === env.id && (t.logo || t.website));
+          if (!hit) return env;
+          return { ...env, logoUrl: hit.logo || env.logoUrl, website: hit.website || env.website };
+        });
+
         return {
           ...s,
           accounts: d.accounts || [],
@@ -556,7 +565,7 @@ export default function App() {
                 </div>
                 {locks.map(({env,lockIn,needs,has,short}) => (
                   <div key={env.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"0.5px solid rgba(255,255,255,.07)"}}>
-                    <span style={{fontSize:18}}>{env.icon}</span>
+                    <EnvIcon env={env} size={26} radius={7} bg="transparent" />
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:14,fontWeight:500}}>{env.name}</div>
                       <div style={{fontSize:12,color:short>0?"#ffd60a":"#30d158",marginTop:1}}>
@@ -622,7 +631,7 @@ export default function App() {
                       return (
                         <div key={env.id} className="card" style={{padding:14}}>
                           <div style={{display:"flex",alignItems:"center",gap:11}}>
-                            <div className="ibox" style={{background:urg+"22"}}>{env.icon}</div>
+                            <EnvIcon env={env} size={36} radius={10} bg={urg+"22"} />
                             <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={()=>setDetailEnv(env)}>
                               <div style={{display:"flex",alignItems:"center",gap:6}}>
                                 <span style={{fontSize:15,fontWeight:600,letterSpacing:"-.3px"}}>{env.name}</span>
@@ -764,7 +773,9 @@ export default function App() {
                 return (
                   <button key={tx.id} className="row row-tap" style={{width:"100%",textAlign:"left",background:"none",border:"none",fontFamily:"inherit",color:"#fff"}}
                     onClick={()=>setTxDetail(tx)}>
-                    <div className="ibox" style={{background:isDeposit?"#30d15822":env?env.color+"22":"#2c2c2e"}}>{isDeposit?"⬇":env?.icon||"💸"}</div>
+                    {isDeposit
+                      ? <div className="ibox" style={{background:"#30d15822"}}>⬇</div>
+                      : <EnvIcon env={env} size={36} radius={10} />}
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:15,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tx.desc}</div>
                       <div style={{fontSize:12,color:"#636366",marginTop:1}}>{isDeposit?"Deposit":env?.name||"Unassigned"} · {tx.date}</div>
@@ -825,6 +836,54 @@ export default function App() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENVELOPE ICON — real logo when we have one, emoji when we don't.
+//
+// Three sources, in order:
+//   1. env.logoUrl   — a logo Plaid gave us, or one you pasted in
+//   2. env.website   — we derive a favicon from the domain
+//   3. env.icon      — your emoji, which always works
+//
+// The emoji is the floor, not a placeholder. Logos fail: domains change, CDNs
+// 404, favicons come back as a blank square. Every failure falls through to the
+// emoji rather than leaving a broken-image icon sitting in your budget.
+// ═════════════════════════════════════════════════════════════════════════════
+function domainOf(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim().toLowerCase();
+  s = s.replace(/^https?:\/\//, "").replace(/^www\./, "");
+  s = s.split("/")[0].split("?")[0];
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(s) ? s : null;
+}
+
+function logoSrcFor(env) {
+  if (env?.logoUrl) return env.logoUrl;
+  const d = domainOf(env?.website);
+  // Google's favicon service — no API key, no signup, works for essentially
+  // every company that has a website.
+  return d ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : null;
+}
+
+function EnvIcon({ env, size = 36, radius = 10, bg, style }) {
+  const [failed, setFailed] = useState(false);
+  const src = failed ? null : logoSrcFor(env);
+  const fontSize = Math.round(size * 0.48);
+
+  return (
+    <div style={{
+      width:size, height:size, borderRadius:radius, flexShrink:0,
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontSize, overflow:"hidden",
+      background: bg !== undefined ? bg : (env?.color ? env.color + "22" : "#2c2c2e"),
+      ...style,
+    }}>
+      {src ? (
+        <img src={src} alt="" onError={()=>setFailed(true)}
+          style={{width:"72%",height:"72%",objectFit:"contain",borderRadius:4}}/>
+      ) : (env?.icon || "💸")}
+    </div>
+  );
+}
+// ═════════════════════════════════════════════════════════════════════════════
 // TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
 // ═════════════════════════════════════════════════════════════════════════════
 function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onClose }) {
@@ -836,7 +895,11 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
   return (
     <Sheet onClose={onClose} title={null}>
       <div style={{textAlign:"center",marginBottom:20}}>
-        <div style={{fontSize:44,marginBottom:10}}>{isDeposit?"⬇":env?.icon||"💸"}</div>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:10}}>
+          {isDeposit
+            ? <div style={{fontSize:44}}>⬇</div>
+            : <EnvIcon env={env} size={52} radius={14} />}
+        </div>
         <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.5px"}}>{tx.desc}</div>
         <div style={{fontSize:26,fontWeight:700,letterSpacing:"-1px",marginTop:6,color:isDeposit?"#30d158":"#fff"}}>
           {isDeposit?`+${money(Math.abs(tx.amount))}`:`−${money(tx.amount)}`}
@@ -846,7 +909,7 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
         </div>
         {!isDeposit && (
           <div style={{display:"inline-block",marginTop:10,background:env?env.color+"22":"#2c2c2e",color:env?env.color:"#8e8e93",borderRadius:20,padding:"5px 14px",fontSize:13,fontWeight:600}}>
-            {env ? `${env.icon} ${env.name}` : "Unassigned"}
+            {env ? env.name : "Unassigned"}
           </div>
         )}
       </div>
@@ -913,7 +976,7 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
             {envelopes.filter(e => e.id !== tx.envelopeId).map(e => (
               <button key={e.id} onClick={()=>onMove(tx, e.id)}
                 style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"11px 14px",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",color:"#fff"}}>
-                <span style={{fontSize:20}}>{e.icon}</span>
+                <EnvIcon env={e} size={30} radius={8} bg="transparent" />
                 <div style={{flex:1,textAlign:"left"}}>
                   <div style={{fontSize:15,fontWeight:500}}>{e.name}</div>
                   <div style={{fontSize:12,color:"#8e8e93"}}>{TYPE_META[e.type].label}</div>
@@ -1166,7 +1229,7 @@ function EnvCard({ env, transactions, onClick }) {
   return (
     <button className="card env-card" onClick={onClick}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
-        <span style={{fontSize:26}}>{env.icon}</span>
+        <EnvIcon env={env} size={34} radius={9} bg="transparent" />
         <div style={{display:"flex",gap:3}}>
           {locked && <span style={{fontSize:13}}>🔒</span>}
           {paid && <span style={{fontSize:13,color:"#30d158"}}>✓</span>}
@@ -1193,7 +1256,7 @@ function EnvRow({ env, transactions, onOpen, onFund }) {
   return (
     <div className="card" style={{padding:16}}>
       <div style={{display:"flex",alignItems:"center",gap:12,cursor:"pointer"}} onClick={onOpen}>
-        <div className="ibox-lg" style={{background:env.color+"22",border:`1px solid ${env.color}33`}}>{env.icon}</div>
+        <EnvIcon env={env} size={42} radius={12} bg={env.color+"22"} style={{border:`1px solid ${env.color}33`}} />
         <div style={{flex:1,minWidth:0}}>
           <div style={{display:"flex",alignItems:"center",gap:6}}>
             <span style={{fontSize:16,fontWeight:600,letterSpacing:"-.3px"}}>{env.name}</span>
@@ -1392,7 +1455,9 @@ function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
         </div>
       )}
       <div style={{display:"flex",alignItems:"center",gap:11}}>
-        <div className="ibox" style={{background:paid?"#30d15822":urg+"22"}}>{paid?"✓":env.icon}</div>
+        {paid
+          ? <div className="ibox" style={{background:"#30d15822"}}>✓</div>
+          : <EnvIcon env={env} size={36} radius={10} bg={urg+"22"} />}
         <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={onOpen}>
           <div style={{display:"flex",alignItems:"center",gap:5}}>
             <span style={{fontSize:15,fontWeight:600,textDecoration:paid?"line-through":"none",color:paid?"#636366":"#fff"}}>{env.name}</span>
@@ -1435,7 +1500,7 @@ function DebtCard({ env, onClick }) {
   return (
     <button className="card" onClick={onClick} style={{padding:17,textAlign:"left",width:"100%",border:risk&&risk.status!=="ok"?"1px solid #ffd60a44":"none"}}>
       <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:13}}>
-        <div className="ibox-lg" style={{background:env.color+"22"}}>{env.icon}</div>
+        <EnvIcon env={env} size={42} radius={12} bg={env.color+"22"} />
         <div style={{flex:1}}>
           <div style={{fontSize:16,fontWeight:600}}>{env.name}</div>
           <div style={{fontSize:12,color:"#636366",marginTop:1}}>
@@ -1490,6 +1555,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
     postPromoAPR: initial.postPromoAPR || "", paymentUrl: initial.paymentUrl || "",
     autopay: initial.autopay || false, autopayLeadDays: initial.autopayLeadDays ?? 5,
     id: initial.id, matchPatterns: initial.matchPatterns || [],
+    website: initial.website || "", logoUrl: initial.logoUrl || "",
   });
   const set = (k,v) => setF(p => ({...p,[k]:v}));
   const bill = isBill(f.type);
@@ -1504,7 +1570,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
 
   function save() {
     if (!f.name.trim()) return;
-    onSave({ ...f, name: f.name.trim(),
+    onSave({ ...f, name: f.name.trim(), website: f.website.trim(),
       monthlyBudget: parseFloat(f.monthlyBudget)||0, billAmount: parseFloat(f.billAmount)||0,
       currentBalance: parseFloat(f.currentBalance)||0, targetAmount: parseFloat(f.targetAmount)||0,
       minimumPayment: parseFloat(f.minimumPayment)||0, postPromoAPR: parseFloat(f.postPromoAPR)||0,
@@ -1632,7 +1698,21 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
         </>
       )}
 
-      <Label style={{marginTop:16}}>Icon</Label>
+      <Label style={{marginTop:16}}>Logo <Dim>(optional)</Dim></Label>
+      <div className="card" style={{padding:13,marginBottom:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}>
+          <EnvIcon env={{icon:f.icon, color:f.color, website:f.website, logoUrl:f.logoUrl}}
+            size={44} radius={12} bg={f.color+"22"} />
+          <div style={{flex:1,fontSize:11.5,color:"#8e8e93",lineHeight:1.5}}>
+            Type a company's website and Budgetgum will pull its logo. Leave it blank
+            to keep the emoji.
+          </div>
+        </div>
+        <input className="in" value={f.website} onChange={e=>set("website",e.target.value)}
+          placeholder="progressive.com" autoCapitalize="none" autoCorrect="off" />
+      </div>
+
+      <Label style={{marginTop:16}}>Emoji <Dim>(used if there's no logo)</Dim></Label>
       <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:6}}>
         {ICONS.map(ic=>(
           <button key={ic} onClick={()=>set("icon",ic)}
@@ -1668,7 +1748,9 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
   return (
     <Sheet onClose={onClose} title={null}>
       <div style={{textAlign:"center",marginBottom:20}}>
-        <div style={{fontSize:52,marginBottom:10}}>{env.icon}</div>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:10}}>
+          <EnvIcon env={env} size={64} radius={16} bg={env.color+"1f"} />
+        </div>
         <div style={{fontSize:12,color:"#8e8e93",letterSpacing:".4px",textTransform:"uppercase"}}>{TYPE_META[env.type].label}</div>
         <div style={{fontSize:24,fontWeight:700,letterSpacing:"-.7px",marginTop:2}}>{env.name}</div>
         {paid && <div style={{display:"inline-block",marginTop:8,background:"#30d15822",color:"#30d158",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:700}}>✓ PAID THIS PERIOD</div>}
@@ -1929,7 +2011,7 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
         {envelopes.map(env=>(
           <button key={env.id} onClick={()=>onAssign(tx, env.id, remember)}
             style={{background:"#2c2c2e",border:"none",borderRadius:13,padding:"12px 14px",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",color:"#fff"}}>
-            <span style={{fontSize:21}}>{env.icon}</span>
+            <EnvIcon env={env} size={32} radius={9} bg="transparent" />
             <div style={{flex:1,textAlign:"left"}}>
               <div style={{fontSize:15,fontWeight:500}}>{env.name}</div>
               <div style={{fontSize:12,color:"#8e8e93"}}>{TYPE_META[env.type].label}</div>
