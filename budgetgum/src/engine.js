@@ -168,6 +168,46 @@ export function periodDueFor(env, dateStr) {
 
 const keyOf = d => (d ? d.toISOString().split("T")[0] : "");
 
+// Same question, but for an actual transaction — which honors a manual override
+// if you've told the app where this payment belongs.
+//
+// Nearest-due is a good guess, but it's still a guess. Paying two months at
+// once, or catching up on something six weeks late, are cases no heuristic gets
+// right. `periodOverride` (an ISO due-date string) is your final say, and it
+// always wins.
+export function periodDueForTx(env, tx) {
+  if (tx && tx.periodOverride) {
+    const d = startOfDay(new Date(tx.periodOverride + "T00:00:00"));
+    if (!isNaN(d.getTime())) return d;
+  }
+  return periodDueFor(env, tx.date);
+}
+
+// A window of due dates centered on where this payment would land automatically,
+// for choosing a different period. Most recent first.
+export function dueDateOptions(env, aroundDate, back = 2, forward = 2) {
+  if (!isBill(env.type)) return [];
+  const center = periodDueFor(env, aroundDate);
+  if (!center) return [];
+
+  // Walk forward from the center to the far end of the window...
+  let cursor = center;
+  for (let i = 0; i < forward; i++) {
+    const nxt = nextDueDate(env, addDays(cursor, 1));
+    if (!nxt) break;
+    cursor = nxt;
+  }
+
+  // ...then back down through it, so the list reads newest → oldest.
+  const out = [];
+  let d = cursor;
+  for (let i = 0; i < back + forward + 1 && d; i++) {
+    out.push(d);
+    d = prevDueDate(env, d);
+  }
+  return out;
+}
+
 // Total credited to the current billing period.
 export function paidThisPeriod(env, transactions) {
   if (!isBill(env.type)) return 0;
@@ -175,7 +215,7 @@ export function paidThisPeriod(env, transactions) {
   return transactions
     .filter(t => t.envelopeId === env.id)
     .filter(t => t.amount > 0)   // outflows only; ignore refunds/inflows
-    .filter(t => keyOf(periodDueFor(env, t.date)) === current)
+    .filter(t => keyOf(periodDueForTx(env, t)) === current)
     .reduce((s, t) => s + t.amount, 0);
 }
 
@@ -242,7 +282,7 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null) {
   transactions
     .filter(t => t.envelopeId === env.id && t.amount > 0)
     .forEach(t => {
-      const k = keyOf(periodDueFor(env, t.date));
+      const k = keyOf(periodDueForTx(env, t));
       if (!k) return;
       if (!byPeriod.has(k)) byPeriod.set(k, []);
       byPeriod.get(k).push(t);

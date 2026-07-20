@@ -5,7 +5,7 @@ import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
-  billAmountStats, amountDrift,
+  billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
   money, daysBetween, DOW,
@@ -422,6 +422,19 @@ export default function App() {
     showToast(on ? "Will keep itself updated" : "Auto-update off");
   }
 
+  // Pin a payment to a specific billing period (or clear the pin and go back to
+  // automatic nearest-due matching). Purely a labeling change — it doesn't move
+  // money, so no balance reversal is needed.
+  function setTransactionPeriod(tx, key) {
+    setState(s => ({
+      ...s,
+      transactions: s.transactions.map(t =>
+        t.id === tx.id ? { ...t, periodOverride: key || undefined } : t),
+    }));
+    setTxDetail(prev => prev && prev.id === tx.id ? { ...prev, periodOverride: key || undefined } : prev);
+    showToast(key ? "Applied to that period" : "Back to automatic");
+  }
+
   function markPaid(env) {
     const key = periodKey(env);
     setEnvelopes(p => p.map(e => {
@@ -805,6 +818,7 @@ export default function App() {
                       onMove={moveTransaction}
                       onRequeue={requeueTransaction}
                       onDelete={deleteTransaction}
+                      onSetPeriod={setTransactionPeriod}
                       onClose={()=>setTxDetail(null)} />}
     </div>
   );
@@ -813,7 +827,7 @@ export default function App() {
 // ═════════════════════════════════════════════════════════════════════════════
 // TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
 // ═════════════════════════════════════════════════════════════════════════════
-function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onClose }) {
+function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onClose }) {
   const [moving, setMoving] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const env = envelopes.find(e => e.id === tx.envelopeId);
@@ -843,7 +857,55 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onClose
           sorted into an envelope. You can still delete it from your history.
         </div>
       ) : !moving ? (
-        <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>Move to another envelope</button>
+        <>
+          {/* Which billing period is this payment for? */}
+          {env && isBill(env.type) && (() => {
+            const options = dueDateOptions(env, tx.date);
+            if (!options.length) return null;
+            const currentKey = periodDueForTx(env, tx).toISOString().split("T")[0];
+            const auto = !tx.periodOverride;
+            return (
+              <div className="card" style={{padding:14,marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:600,marginBottom:3}}>Which bill is this for?</div>
+                <div style={{fontSize:11.5,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+                  {auto
+                    ? "Matched automatically to the nearest due date. Change it if that's not right."
+                    : "You set this manually."}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {options.map(d => {
+                    const k = d.toISOString().split("T")[0];
+                    const on = k === currentKey;
+                    return (
+                      <button key={k} onClick={()=>onSetPeriod(tx, on && !auto ? null : k)}
+                        style={{background:on?"#c5f13518":"#2c2c2e",border:on?"1px solid #c5f135":"1px solid transparent",
+                                borderRadius:11,padding:"10px 13px",display:"flex",alignItems:"center",gap:10,
+                                cursor:"pointer",fontFamily:"inherit",color:"#fff",textAlign:"left"}}>
+                        <div style={{width:18,height:18,borderRadius:9,flexShrink:0,border:on?"5px solid #c5f135":"1.5px solid #48484a"}}/>
+                        <div style={{flex:1}}>
+                          <div style={{fontSize:14,fontWeight:500,color:on?"#c5f135":"#fff"}}>
+                            {d.toLocaleDateString("en-US",{month:"long",year:"numeric"})}
+                          </div>
+                          <div style={{fontSize:11,color:"#8e8e93",marginTop:1}}>
+                            due {d.toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                            {on && auto ? " · auto-matched" : ""}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {!auto && (
+                  <button className="btn-mini" style={{marginTop:9,width:"100%",color:"#8e8e93"}}
+                    onClick={()=>onSetPeriod(tx, null)}>
+                    Back to automatic
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+          <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>Move to another envelope</button>
+        </>
       ) : (
         <div className="card" style={{padding:14,marginBottom:8}}>
           <div style={{fontSize:13,color:"#8e8e93",marginBottom:10}}>Move to…</div>
