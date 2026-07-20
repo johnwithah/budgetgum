@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { usePlaidLink } from "react-plaid-link";
-import { useCloudState, EMPTY_STATE } from "./useCloudState";
+import { useCloudState, EMPTY_STATE, clearCache } from "./useCloudState";
 import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
@@ -479,7 +479,51 @@ export default function App() {
   }
 
   async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
-  async function logout() { await api("/api/logout").catch(()=>{}); setAuthState("locked"); }
+  async function logout() {
+    await api("/api/logout").catch(()=>{});
+    clearCache();              // don't leave balances in browser storage while locked
+    setAuthState("locked");
+  }
+
+  // ── AUTO-LOCK ─────────────────────────────────────────────────────────────
+  // Walk away from the laptop and the app locks itself. This calls the real
+  // logout endpoint rather than just covering the screen — the session cookie
+  // is destroyed, so reopening the tab (or hitting back) can't get you in.
+  //
+  // Any real interaction resets the clock. We deliberately don't count
+  // mousemove: a nudged desk or a cat shouldn't keep your bank data on screen.
+  const lastActivity = useRef(Date.now());
+  const lockMinutes = state.autoLockMinutes ?? 10;
+
+  useEffect(() => {
+    if (authState !== "unlocked" || lockMinutes === 0) return;
+
+    const bump = () => { lastActivity.current = Date.now(); };
+    const events = ["mousedown", "keydown", "touchstart", "scroll", "focus"];
+    events.forEach(e => window.addEventListener(e, bump, { passive: true }));
+
+    const limit = lockMinutes * 60 * 1000;
+
+    const check = () => {
+      if (Date.now() - lastActivity.current >= limit) logout();
+    };
+
+    // Poll rather than one long timeout, so a laptop that was asleep for an
+    // hour locks the moment it wakes instead of when a stale timer fires.
+    const timer = setInterval(check, 15000);
+
+    // Coming back to a backgrounded tab is the highest-risk moment — check
+    // immediately rather than waiting up to 15s for the next poll.
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      events.forEach(e => window.removeEventListener(e, bump));
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authState, lockMinutes]);
 
   if (authState === "checking")
     return <div style={{background:"#000",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{fontSize:44,opacity:.35}}>🍬</div></div>;
@@ -498,6 +542,9 @@ export default function App() {
               <span className="eyebrow">🍬 Budgetgum</span>
               <SyncDot status={syncStatus} />
               <button onClick={()=>setSettings(true)} className="tiny-link">Settings</button>
+              <button onClick={logout} className="lock-btn" title={`Lock now (auto-locks after ${lockMinutes} min)`}>
+                🔒 Lock
+              </button>
             </div>
             <div style={{fontSize:44,fontWeight:700,letterSpacing:"-2.2px",lineHeight:1,color:sts>=0?"#c5f135":"#ff375f"}}>
               {money(sts)}
@@ -1115,6 +1162,26 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, onDisconnect
         <div className="row" style={{justifyContent:"space-between"}}>
           <span style={{fontSize:14.5,color:"#8e8e93"}}>Transactions</span>
           <span style={{fontSize:14.5,fontWeight:600}}>{state.transactions.length}</span>
+        </div>
+      </div>
+
+      {/* Auto-lock */}
+      <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
+        <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>Lock automatically after</div>
+        <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+          Signs you out when you stop using it, so your balances aren't sitting on screen.
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          {[[5,"5m"],[10,"10m"],[30,"30m"],[60,"1h"],[0,"Never"]].map(([m,label])=>{
+            const on = (state.autoLockMinutes ?? 10) === m;
+            return (
+              <button key={m} onClick={()=>{ saveNow({...state, autoLockMinutes:m}); onToast(m===0?"Auto-lock off":`Locks after ${label}`); }}
+                style={{flex:1,background:on?"#c5f135":"#2c2c2e",color:on?"#000":"#fff",border:"none",
+                        borderRadius:9,padding:"9px 0",fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                {label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -2092,6 +2159,8 @@ button{-webkit-tap-highlight-color:transparent}
 .sec{font-size:12.5px;font-weight:600;color:#636366;text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px}
 .eyebrow{font-size:12px;font-weight:600;color:#636366;letter-spacing:.4px;text-transform:uppercase}
 .tiny-link{background:none;border:none;color:#48484a;font-size:11px;cursor:pointer;font-family:inherit;padding:0;text-decoration:underline}
+.lock-btn{background:#2c2c2e;border:none;color:#aeaeb2;font-size:10.5px;font-weight:600;cursor:pointer;font-family:inherit;padding:4px 9px;border-radius:8px;letter-spacing:.2px;transition:background .12s}
+.lock-btn:active{background:#3a3a3c}
 
 .tabs{display:flex;border-bottom:.5px solid rgba(255,255,255,.1);margin-top:18px}
 .tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9px;font-weight:500;letter-spacing:.2px;text-transform:uppercase;font-family:inherit;transition:color .15s}

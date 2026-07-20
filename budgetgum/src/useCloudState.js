@@ -42,6 +42,7 @@ export const EMPTY_STATE = {
   ignored: [],                 // ids of deleted transactions — never re-import
   lastSync: null,
   importSince: "2026-07-14",   // only import bank transactions on/after this date
+  autoLockMinutes: 10,         // sign out after this many minutes idle (0 = never)
 };
 
 function readCache() {
@@ -69,6 +70,17 @@ function readCache() {
 
 function writeCache(state) {
   try { localStorage.setItem(CACHE_KEY, JSON.stringify(state)); } catch {}
+}
+
+// Wipe the local copy. Called on lock/sign-out so your balances aren't sitting
+// in browser storage while the app is locked. Costs nothing: signing back in
+// requires the network anyway, and the server has the real copy.
+export function clearCache() {
+  try {
+    localStorage.removeItem(CACHE_KEY);
+    ["bg_envelopes","bg_transactions","bg_accounts","bg_unmapped","bg_last_sync"]
+      .forEach(k => localStorage.removeItem(k));
+  } catch {}
 }
 
 export function useCloudState(enabled) {
