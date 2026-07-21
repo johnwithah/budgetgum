@@ -666,7 +666,9 @@ export default function App() {
               <>
                 <div className="eyebrow" style={{marginBottom:5}}>In Checking</div>
                 <div style={{fontSize:22,fontWeight:700,letterSpacing:"-1px"}}>{money(checkingBalance)}</div>
-                <div style={{fontSize:12,color:"#636366",marginTop:2}}>{money(envelopes.reduce((s,e)=>s+(e.funded||0),0))} reserved</div>
+                <div style={{fontSize:12,color:"#636366",marginTop:2}}>
+                  − {money(envelopes.reduce((s,e)=>s+(e.funded||0),0))} set aside
+                </div>
                 <button onClick={syncBank} disabled={syncing} className="tiny-link" style={{color:syncing?"#48484a":"#0a84ff",marginTop:4}}>
                   {syncing ? "Syncing…" : "Sync"}
                 </button>
@@ -1763,13 +1765,22 @@ function EmptyState({ onAdd }) {
 function EnvCard({ env, transactions, onClick }) {
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
-  let big, small, pct, barColor;
+  let big, small, pct, barColor, bigColor;
+
   if (env.type === TYPES.SPENDING) {
     const spent = spentThisMonth(env, transactions);
-    const left = (env.monthlyBudget||0) - spent;
-    big = money(left); small = `of ${money(env.monthlyBudget)}`;
-    pct = Math.min(100, (spent/(env.monthlyBudget||1))*100);
-    barColor = pct>90?"#ff375f":pct>70?"#ffd60a":env.color;
+    const budget = env.monthlyBudget || 0;
+    const left = budget - spent;
+    const over = left < 0;
+
+    // Overspending used to render as a bare negative — "-$120" with no context,
+    // which reads like a broken number rather than a fact about your month.
+    // Say it in words and show the comparison underneath.
+    big      = over ? `${money(Math.abs(left))} over` : money(left);
+    small    = over ? `${money(spent)} of ${money(budget)} planned` : `of ${money(budget)} planned`;
+    bigColor = over ? "#ff375f" : "#fff";
+    pct      = Math.min(100, budget > 0 ? (spent / budget) * 100 : 0);
+    barColor = over ? "#ff375f" : pct > 85 ? "#ffd60a" : env.color;
   } else if (env.type === TYPES.DEBT) {
     big = money(env.currentBalance||0); small = "still owed";
     pct = progress(env); barColor = "#30d158";
@@ -1781,6 +1792,9 @@ function EnvCard({ env, transactions, onClick }) {
     pct = paid?100:Math.min(100,((env.funded||0)/(env.billAmount||1))*100);
     barColor = paid?"#30d158":env.color;
   }
+
+  const funded = env.funded || 0;
+
   return (
     <button className="card env-card" onClick={onClick}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
@@ -1791,12 +1805,19 @@ function EnvCard({ env, transactions, onClick }) {
         </div>
       </div>
       <div style={{fontSize:12,color:"#636366",fontWeight:500,marginBottom:2}}>{env.name}</div>
-      <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.9px",lineHeight:1.1}}>{big}</div>
+      <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.9px",lineHeight:1.1,color:bigColor||"#fff"}}>{big}</div>
       <div style={{fontSize:11,color:"#48484a",marginBottom:9}}>{small}</div>
       <div className="bar"><div className="fill" style={{width:`${pct}%`,background:barColor}}/></div>
-      {(env.funded||0) > 0 && (
-        <div style={{fontSize:10,color:locked?"#ffd60a":"#8e8e93",marginTop:6}}>
-          {locked ? "🔒 " : ""}{money(env.funded)} set aside
+
+      {/* Funded money is real money out of Safe to Spend — it deserves more than
+          10px of grey text. Given its own chip so it reads as a separate fact
+          from the budget math above it. */}
+      {funded > 0 && (
+        <div style={{marginTop:8,background:locked?"#2a2408":"#2c2c2e",borderRadius:8,padding:"5px 8px",
+                     display:"flex",alignItems:"center",gap:5}}>
+          <span style={{fontSize:10}}>{locked ? "🔒" : "◈"}</span>
+          <span style={{fontSize:11,fontWeight:600,color:locked?"#ffd60a":"#c5f135"}}>{money(funded)}</span>
+          <span style={{fontSize:9.5,color:"#8e8e93"}}>set aside</span>
         </div>
       )}
     </button>
@@ -2365,13 +2386,23 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
             {paid && <DRow k="Paid this period" v={money(paidThisPeriod(env, transactions))} accent />}
           </>
         )}
-        {env.type === TYPES.SPENDING && (
-          <>
-            <DRow k="Monthly budget" v={money(env.monthlyBudget)} />
-            <DRow k="Spent this month" v={money(spentThisMonth(env, transactions))} />
-            <DRow k="Left" v={money((env.monthlyBudget||0) - spentThisMonth(env, transactions))} accent />
-          </>
-        )}
+        {env.type === TYPES.SPENDING && (() => {
+          const spent = spentThisMonth(env, transactions);
+          const budget = env.monthlyBudget || 0;
+          const left = budget - spent;
+          const over = left < 0;
+          return (
+            <>
+              <DRow k="Planned for the month" v={money(budget)} />
+              <DRow k="Spent so far" v={money(spent)} />
+              <DRow k={over ? "Over budget by" : "Still available"}
+                    v={money(Math.abs(left))}
+                    accent={!over}
+                    danger={over} />
+              <DRow k="Set aside from Safe to Spend" v={money(env.funded || 0)} />
+            </>
+          );
+        })()}
         {env.type === TYPES.GOAL && (
           <>
             <DRow k="Saved" v={money(env.currentBalance||0)} accent />
@@ -2607,10 +2638,10 @@ function Sheet({ children, onClose, title }) {
 }
 const Label = ({children,style}) => <div style={{fontSize:12.5,color:"#8e8e93",fontWeight:500,margin:"13px 0 6px",...style}}>{children}</div>;
 const Dim = ({children}) => <span style={{color:"#48484a",fontWeight:400}}>{children}</span>;
-const DRow = ({k,v,accent}) => (
+const DRow = ({k,v,accent,danger}) => (
   <div className="row" style={{justifyContent:"space-between",padding:"12px 15px"}}>
     <span style={{fontSize:14.5,color:"#8e8e93"}}>{k}</span>
-    <span style={{fontSize:14.5,fontWeight:600,color:accent?"#c5f135":"#fff"}}>{v}</span>
+    <span style={{fontSize:14.5,fontWeight:600,color:danger?"#ff375f":accent?"#c5f135":"#fff"}}>{v}</span>
   </div>
 );
 
