@@ -645,7 +645,7 @@ export default function App() {
       {toast && <div className="toast">{toast}</div>}
 
       {/* ═══ HEADER ═══ */}
-      <div style={{padding:"24px 22px 0"}}>
+      <div style={{padding:"max(24px, calc(env(safe-area-inset-top) + 12px)) 22px 0"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
           <div>
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
