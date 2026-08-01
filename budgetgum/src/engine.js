@@ -455,6 +455,63 @@ export function amountDrift(env, transactions) {
   return { ...stats, current, diff, under: diff > 0 };
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// SPENDING REPORTS — plan vs actual, per month.
+//
+// The funded balance (env.funded) is the real, carried-over money — that's the
+// headline on the card and it's handled by the funding mechanics, not here.
+// THIS is the other half: the backward-looking report. For each calendar month,
+// what did you plan to spend, and what did you actually spend (real debits)?
+//
+// Spending resets each month; the funded balance does not. These two are fully
+// decoupled — this function never looks at env.funded, only at transactions.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Net spent in a specific calendar month (outflows minus refunds).
+export function spentInMonth(env, transactions, year, monthIndex) {
+  return transactions
+    .filter(t => t.envelopeId === env.id)
+    .filter(t => {
+      const d = new Date(t.date + "T00:00:00");
+      return d.getFullYear() === year && d.getMonth() === monthIndex;
+    })
+    .reduce((s, t) => s + t.amount, 0);   // outflow +, refund −
+}
+
+// Per-month plan-vs-actual history, most recent first. `plan` is the current
+// monthlyBudget applied across months — we don't store historical plan values,
+// so this reflects your budget as it stands now. Good enough for spotting
+// patterns, which is the point.
+export function spendingHistory(env, transactions, count = 6) {
+  if (env.type !== TYPES.SPENDING) return [];
+  const plan = env.monthlyBudget || 0;
+  const now = new Date();
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const spent = spentInMonth(env, transactions, d.getFullYear(), d.getMonth());
+    out.push({
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
+      label: d.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
+      shortLabel: d.toLocaleDateString("en-US", { month: "short" }),
+      plan,
+      spent,
+      remaining: plan - spent,
+      over: spent > plan && plan > 0,
+      pct: plan > 0 ? Math.min(100, (spent / plan) * 100) : 0,
+      isCurrent: i === 0,
+    });
+  }
+  return out;
+}
+
+// How much more you'd fund to fully cover this month's plan — the "funding gap."
+// This is the forward-looking guide: fund toward it to get (and stay) ahead.
+export function fundingGap(env) {
+  if (env.type !== TYPES.SPENDING) return 0;
+  return Math.max(0, (env.monthlyBudget || 0) - (env.funded || 0));
+}
+
 export function targetAmount(env) {
   switch (env.type) {
     case TYPES.SPENDING:  return env.monthlyBudget || 0;

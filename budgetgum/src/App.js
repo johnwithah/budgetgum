@@ -5,6 +5,7 @@ import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
+  spendingHistory, fundingGap, spentInMonth,
   billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
@@ -690,7 +691,7 @@ export default function App() {
         )}
 
         <div className="tabs">
-          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["spending","▤","Spending"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
             <button key={t} onClick={()=>setTab(t)} className={`tab ${tab===t?"on":""}`}>
               <span style={{fontSize:18}}>{ic}</span>{l}
             </button>
@@ -913,6 +914,27 @@ export default function App() {
         </div>
       )}
 
+      {/* ═══ SPENDING ═══ */}
+      {tab === "spending" && (
+        <div style={S.page}>
+          <div className="sec">Spending</div>
+          {spendingEnvelopes.length === 0 ? (
+            <div className="card" style={{padding:28,textAlign:"center"}}>
+              <div style={{fontSize:36,marginBottom:10}}>▤</div>
+              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No spending envelopes</div>
+              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                Add a Spending envelope for a category like groceries or gas. You'll see each
+                month's plan against what you actually spent.
+              </div>
+              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.SPENDING})}>Add Spending</button>
+            </div>
+          ) : (
+            <SpendingView envelopes={spendingEnvelopes} transactions={transactions}
+              onOpen={env=>setDetailEnv(env)} />
+          )}
+        </div>
+      )}
+
       {/* ═══ ACTIVITY ═══ */}
       {tab === "activity" && (
         <div style={S.page}>
@@ -974,7 +996,7 @@ export default function App() {
       )}
 
       <div className="tabbar">
-        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["spending","▤","Spending"],["activity","≡","Activity"]].map(([t,ic,l])=>(
           <button key={t} onClick={()=>setTab(t)} className={`tb ${tab===t?"on":""}`}>
             <span style={{fontSize:21}}>{ic}</span>{l}
           </button>
@@ -1762,26 +1784,151 @@ function EmptyState({ onAdd }) {
   );
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// SPENDING VIEW — the plan-vs-actual report.
+//
+// The forward-looking allocation stuff (what's funded, how much to go) lives on
+// the envelope cards. THIS tab is the backward-looking mirror: for the selected
+// month, what did you plan and what did you actually spend, per category — so
+// you can learn your habits and plan next month wiser.
+//
+// Funded balances never appear here. This is purely about the monthly plan and
+// the real debits against it.
+// ═════════════════════════════════════════════════════════════════════════════
+function SpendingView({ envelopes, transactions, onOpen }) {
+  const now = new Date();
+  const [offset, setOffset] = useState(0);   // 0 = this month, 1 = last month, …
+
+  const viewDate = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+  const y = viewDate.getFullYear(), m = viewDate.getMonth();
+  const monthLabel = viewDate.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const isCurrent = offset === 0;
+
+  const rows = envelopes.map(env => {
+    const spent = spentInMonth(env, transactions, y, m);
+    const plan = env.monthlyBudget || 0;
+    return { env, spent, plan, remaining: plan - spent, over: spent > plan && plan > 0,
+             pct: plan > 0 ? Math.min(100, (spent / plan) * 100) : 0 };
+  }).sort((a, b) => b.spent - a.spent);
+
+  const totalPlan  = rows.reduce((s, r) => s + r.plan, 0);
+  const totalSpent = rows.reduce((s, r) => s + r.spent, 0);
+  const totalPct   = totalPlan > 0 ? Math.min(100, (totalSpent / totalPlan) * 100) : 0;
+  const totalOver  = totalSpent > totalPlan && totalPlan > 0;
+
+  return (
+    <>
+      {/* Month pager */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+        <button className="link" style={{fontSize:22,color:"#8e8e93",padding:"0 6px"}}
+          onClick={()=>setOffset(o=>o+1)}>‹</button>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:17,fontWeight:700,letterSpacing:"-.4px"}}>{monthLabel}</div>
+          {isCurrent && <div style={{fontSize:11,color:"#8e8e93",marginTop:1}}>this month so far</div>}
+        </div>
+        <button className="link" style={{fontSize:22,color:offset===0?"#2c2c2e":"#8e8e93",padding:"0 6px"}}
+          onClick={()=>setOffset(o=>Math.max(0,o-1))} disabled={offset===0}>›</button>
+      </div>
+
+      {/* Month total */}
+      <div className="card" style={{padding:"16px 18px",marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+          <div>
+            <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:500,textTransform:"uppercase",letterSpacing:".5px"}}>Spent</div>
+            <div style={{fontSize:26,fontWeight:700,letterSpacing:"-1.2px",color:totalOver?"#ff375f":"#fff"}}>{money(totalSpent)}</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:11.5,color:"#8e8e93"}}>of {money(totalPlan)} planned</div>
+            {totalPlan > 0 && (
+              <div style={{fontSize:13,fontWeight:600,color:totalOver?"#ff375f":"#30d158",marginTop:2}}>
+                {totalOver ? `${money(totalSpent-totalPlan)} over` : `${money(totalPlan-totalSpent)} left`}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="bar" style={{height:6}}>
+          <div className="fill" style={{width:`${totalPct}%`,background:totalOver?"#ff375f":"#30d158"}}/>
+        </div>
+      </div>
+
+      {/* Per-category */}
+      <div style={{display:"flex",flexDirection:"column",gap:9}}>
+        {rows.map(({env,spent,plan,remaining,over,pct}) => (
+          <button key={env.id} className="card row-tap" onClick={()=>onOpen(env)}
+            style={{padding:14,width:"100%",textAlign:"left",background:"#1c1c1e",border:"none",fontFamily:"inherit",color:"#fff",cursor:"pointer"}}>
+            <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:10}}>
+              <EnvIcon env={env} size={34} radius={9} bg="transparent" />
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:15,fontWeight:600}}>{env.name}</div>
+                <div style={{fontSize:12,color:over?"#ff375f":"#8e8e93",marginTop:1}}>
+                  {plan > 0
+                    ? (over ? `${money(spent-plan)} over plan` : `${money(remaining)} left of ${money(plan)}`)
+                    : "No plan set"}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:16,fontWeight:700,letterSpacing:"-.4px",color:over?"#ff375f":"#fff"}}>{money(spent)}</div>
+                {plan > 0 && <div style={{fontSize:10.5,color:"#8e8e93"}}>of {money(plan)}</div>}
+              </div>
+            </div>
+            <div className="bar"><div className="fill" style={{width:`${pct}%`,background:over?"#ff375f":pct>85?"#ffd60a":env.color}}/></div>
+          </button>
+        ))}
+      </div>
+
+      <div style={{fontSize:11.5,color:"#48484a",textAlign:"center",marginTop:16,lineHeight:1.5,padding:"0 20px"}}>
+        This is your spending report. Money set aside in each envelope lives on the
+        Home and Envelopes screens.
+      </div>
+    </>
+  );
+}
+
 function EnvCard({ env, transactions, onClick }) {
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
-  let big, small, pct, barColor, bigColor;
 
+  // ── Spending envelopes get their own layout ──────────────────────────────
+  // The headline is the FUNDED BALANCE — real money set aside, carried over
+  // month to month. The bar tracks funding progress toward this month's plan
+  // (the "am I getting ahead" number), NOT spending. Spending lives in its own
+  // tab now. This is the allocation view: how much have I set aside, how much
+  // more to fully fund.
   if (env.type === TYPES.SPENDING) {
-    const spent = spentThisMonth(env, transactions);
-    const budget = env.monthlyBudget || 0;
-    const left = budget - spent;
-    const over = left < 0;
+    const funded = env.funded || 0;
+    const plan = env.monthlyBudget || 0;
+    const gap = Math.max(0, plan - funded);
+    const fullyFunded = plan > 0 && gap <= 0.005;
+    const pct = plan > 0 ? Math.min(100, (funded / plan) * 100) : 0;
+    const monthLabel = new Date().toLocaleDateString("en-US", { month: "long" });
 
-    // Overspending used to render as a bare negative — "-$120" with no context,
-    // which reads like a broken number rather than a fact about your month.
-    // Say it in words and show the comparison underneath.
-    big      = over ? `${money(Math.abs(left))} over` : money(left);
-    small    = over ? `${money(spent)} of ${money(budget)} planned` : `of ${money(budget)} planned`;
-    bigColor = over ? "#ff375f" : "#fff";
-    pct      = Math.min(100, budget > 0 ? (spent / budget) * 100 : 0);
-    barColor = over ? "#ff375f" : pct > 85 ? "#ffd60a" : env.color;
-  } else if (env.type === TYPES.DEBT) {
+    return (
+      <button className="card env-card" onClick={onClick}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+          <EnvIcon env={env} size={34} radius={9} bg="transparent" />
+          {fullyFunded && <span style={{fontSize:13,color:"#30d158"}}>✓</span>}
+        </div>
+        <div style={{fontSize:12,color:"#636366",fontWeight:500,marginBottom:2}}>{env.name}</div>
+        <div style={{fontSize:22,fontWeight:700,letterSpacing:"-1px",lineHeight:1.1,color:funded>0?"#c5f135":"#fff"}}>
+          {money(funded)}
+        </div>
+        <div style={{fontSize:11,color:"#48484a",marginBottom:9}}>set aside</div>
+        <div className="bar">
+          <div className="fill" style={{width:`${pct}%`,background:fullyFunded?"#30d158":"#c5f135"}}/>
+        </div>
+        <div style={{fontSize:10.5,color:fullyFunded?"#30d158":"#8e8e93",marginTop:7,lineHeight:1.4}}>
+          {plan <= 0
+            ? "No monthly plan set"
+            : fullyFunded
+              ? `Fully funded for ${monthLabel} ✓`
+              : `of ${money(plan)} · ${money(gap)} to go`}
+        </div>
+      </button>
+    );
+  }
+
+  let big, small, pct, barColor;
+  if (env.type === TYPES.DEBT) {
     big = money(env.currentBalance||0); small = "still owed";
     pct = progress(env); barColor = "#30d158";
   } else if (env.type === TYPES.GOAL) {
@@ -1805,13 +1952,10 @@ function EnvCard({ env, transactions, onClick }) {
         </div>
       </div>
       <div style={{fontSize:12,color:"#636366",fontWeight:500,marginBottom:2}}>{env.name}</div>
-      <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.9px",lineHeight:1.1,color:bigColor||"#fff"}}>{big}</div>
+      <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.9px",lineHeight:1.1,color:"#fff"}}>{big}</div>
       <div style={{fontSize:11,color:"#48484a",marginBottom:9}}>{small}</div>
       <div className="bar"><div className="fill" style={{width:`${pct}%`,background:barColor}}/></div>
 
-      {/* Funded money is real money out of Safe to Spend — it deserves more than
-          10px of grey text. Given its own chip so it reads as a separate fact
-          from the budget math above it. */}
       {funded > 0 && (
         <div style={{marginTop:8,background:locked?"#2a2408":"#2c2c2e",borderRadius:8,padding:"5px 8px",
                      display:"flex",alignItems:"center",gap:5}}>
@@ -2681,7 +2825,7 @@ button{-webkit-tap-highlight-color:transparent}
 .lock-btn:active{background:#3a3a3c}
 
 .tabs{display:flex;border-bottom:.5px solid rgba(255,255,255,.1);margin-top:18px}
-.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9px;font-weight:500;letter-spacing:.2px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:8.5px;font-weight:500;letter-spacing:.1px;text-transform:uppercase;font-family:inherit;transition:color .15s}
 .tab.on{color:#c5f135;border-bottom-color:#c5f135}
 
 .tabbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:rgba(0,0,0,.85);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-top:.5px solid rgba(255,255,255,.1);display:flex;padding:10px 0 28px;z-index:40}
