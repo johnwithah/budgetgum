@@ -841,16 +841,12 @@ export default function App() {
       {tab === "envelopes" && (
         <div style={S.page}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-            <div className="sec" style={{margin:0}}>All Envelopes</div>
+            <div className="sec" style={{margin:0}}>Envelopes</div>
             <button className="link" onClick={()=>setEditEnv({})}>+ New</button>
           </div>
           {envelopes.length === 0 ? <EmptyState onAdd={()=>setEditEnv({})} /> : (
-            <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              {envelopes.map(env => (
-                <EnvRow key={env.id} env={env} transactions={transactions}
-                  onOpen={()=>setDetailEnv(env)} onFund={()=>setFundEnv(env)} />
-              ))}
-            </div>
+            <EnvelopesView envelopes={envelopes} transactions={transactions}
+              onOpen={env=>setDetailEnv(env)} onFund={env=>setFundEnv(env)} />
           )}
         </div>
       )}
@@ -1965,6 +1961,104 @@ function EnvCard({ env, transactions, onClick }) {
         </div>
       )}
     </button>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENVELOPES VIEW — find things fast.
+//
+// A flat list is fine with six envelopes and useless with twenty. Two controls:
+// a filter (All / Spending / Bills) and a sort. In "All", bills come first and
+// spending after, because "what's coming up" is the more urgent question — you
+// glance here to see what's due, then scroll to the discretionary stuff.
+//
+// Bills sort by due date by default (soonest first) — the natural "what's next"
+// order. Everything can also go alphabetical for when you're hunting a specific
+// envelope by name.
+// ═════════════════════════════════════════════════════════════════════════════
+function EnvelopesView({ envelopes, transactions, onOpen, onFund }) {
+  const [filter, setFilter] = useState("all");    // all | spending | bills
+  const [sort, setSort] = useState("due");        // due | name
+
+  const isBillType = e => isBill(e.type);
+  const isSpendType = e => e.type === TYPES.SPENDING;
+
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const byDue = (a, b) => {
+    const ad = nextDueDate(a), bd = nextDueDate(b);
+    if (ad && bd) return ad - bd;
+    if (ad) return -1;
+    if (bd) return 1;
+    return byName(a, b);
+  };
+
+  // Build the sections to show based on the filter.
+  const sections = [];
+  if (filter === "all" || filter === "bills") {
+    const bills = envelopes.filter(isBillType).sort(sort === "name" ? byName : byDue);
+    if (bills.length) sections.push({ key: "bills", label: "Bills & Debts", items: bills });
+  }
+  if (filter === "all" || filter === "spending") {
+    const spend = envelopes.filter(isSpendType).sort(byName);   // spending has no due date
+    if (spend.length) sections.push({ key: "spending", label: "Spending", items: spend });
+  }
+  // Goals (and anything else) only surface in "All", after the rest.
+  if (filter === "all") {
+    const other = envelopes.filter(e => !isBillType(e) && !isSpendType(e)).sort(byName);
+    if (other.length) sections.push({ key: "other", label: "Goals", items: other });
+  }
+
+  const showSort = filter !== "spending";   // spending is always alphabetical
+
+  return (
+    <>
+      {/* Filter */}
+      <div style={{display:"flex",gap:6,background:"#1c1c1e",borderRadius:11,padding:4,marginBottom:12}}>
+        {[["all","All"],["spending","Spending"],["bills","Bills"]].map(([v,label])=>(
+          <button key={v} onClick={()=>setFilter(v)}
+            style={{flex:1,background:filter===v?"#2c2c2e":"transparent",color:filter===v?"#fff":"#8e8e93",
+                    border:"none",borderRadius:8,padding:"8px 0",fontSize:13.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* Sort toggle — only where it's meaningful */}
+      {showSort && (
+        <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+          <button onClick={()=>setSort(s => s === "due" ? "name" : "due")}
+            style={{background:"none",border:"none",color:"#0a84ff",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:5}}>
+            <span style={{fontSize:12,color:"#8e8e93"}}>Sort:</span>
+            {sort === "due" ? "Due date" : "Name"}
+            <span style={{fontSize:10,color:"#8e8e93"}}>⇄</span>
+          </button>
+        </div>
+      )}
+
+      {sections.map((section, i) => (
+        <div key={section.key} style={{marginBottom:i < sections.length-1 ? 22 : 0}}>
+          {filter === "all" && (
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#636366",textTransform:"uppercase",letterSpacing:".6px"}}>{section.label}</div>
+              <div style={{flex:1,height:".5px",background:"rgba(255,255,255,.08)"}}/>
+              <div style={{fontSize:11,color:"#48484a"}}>{section.items.length}</div>
+            </div>
+          )}
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {section.items.map(env => (
+              <EnvRow key={env.id} env={env} transactions={transactions}
+                onOpen={()=>onOpen(env)} onFund={()=>onFund(env)} />
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {sections.length === 0 && (
+        <div className="card" style={{padding:24,textAlign:"center",fontSize:13,color:"#636366"}}>
+          {filter === "spending" ? "No spending envelopes yet." : "No bills yet."}
+        </div>
+      )}
+    </>
   );
 }
 
