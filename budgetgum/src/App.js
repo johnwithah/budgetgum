@@ -113,6 +113,7 @@ export default function App() {
   const [mapTx, setMapTx] = useState(null);
   const [txDetail, setTxDetail] = useState(null);   // a sorted transaction being viewed/edited
   const [activityView, setActivityView] = useState("all");   // all | income
+  const [insightsView, setInsightsView] = useState("spending");   // spending | debt | income
   const [settings, setSettings] = useState(false);
 
   const checkingBalance = useMemo(
@@ -691,7 +692,7 @@ export default function App() {
         )}
 
         <div className="tabs">
-          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["spending","▤","Spending"],["debt","◐","Debt"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+          {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"],["insights","◔","Insights"]].map(([t,ic,l])=>(
             <button key={t} onClick={()=>setTab(t)} className={`tab ${tab===t?"on":""}`}>
               <span style={{fontSize:18}}>{ic}</span>{l}
             </button>
@@ -874,59 +875,71 @@ export default function App() {
       )}
 
       {/* ═══ DEBT PAYOFF ═══ */}
-      {tab === "debt" && (
+      {/* ═══ INSIGHTS — reports live here: Spending · Debt · Income ═══ */}
+      {tab === "insights" && (
         <div style={S.page}>
-          <div className="sec">Debt Payoff</div>
-          {debts.length === 0 ? (
-            <div className="card" style={{padding:28,textAlign:"center"}}>
-              <div style={{fontSize:36,marginBottom:10}}>◐</div>
-              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No debts tracked</div>
-              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
-                Add a Debt envelope to watch a credit card or loan drop toward zero — with a
-                suggested payment and a warning if a 0% period is running out.
-              </div>
-              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.DEBT})}>Track a Debt</button>
-            </div>
-          ) : (
-            <>
-              {/* Quick totals across every debt */}
-              <div className="card" style={{padding:"16px 18px",marginBottom:16,display:"flex"}}>
-                {[
-                  ["Total owed", money(debts.reduce((s,e)=>s+(e.currentBalance||0),0)), "#fff"],
-                  ["Paid off", money(debts.reduce((s,e)=>s+Math.max(0,(e.originalBalance||0)-(e.currentBalance||0)),0)), "#30d158"],
-                  ["Suggested/mo", money(debts.reduce((s,e)=>s+suggestedPayment(e),0)), "#c5f135"],
-                ].map(([label,val,color],i)=>(
-                  <div key={i} style={{flex:1,textAlign:i===0?"left":i===1?"center":"right"}}>
-                    <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:500,marginBottom:4}}>{label}</div>
-                    <div style={{fontSize:18,fontWeight:700,letterSpacing:"-.8px",color}}>{val}</div>
-                  </div>
-                ))}
-              </div>
-              <div style={{display:"flex",flexDirection:"column",gap:10}}>
-                {debts.map(env => <DebtCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
-              </div>
-            </>
-          )}
-        </div>
-      )}
+          <div className="sec">Insights</div>
+          <div style={{display:"flex",gap:6,background:"#1c1c1e",borderRadius:11,padding:4,marginBottom:16}}>
+            {[["spending","Spending"],["debt","Debt"],["income","Income"]].map(([v,label])=>(
+              <button key={v} onClick={()=>setInsightsView(v)}
+                style={{flex:1,background:insightsView===v?"#2c2c2e":"transparent",color:insightsView===v?"#fff":"#8e8e93",
+                        border:"none",borderRadius:8,padding:"8px 0",fontSize:13.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                {label}
+              </button>
+            ))}
+          </div>
 
-      {/* ═══ SPENDING ═══ */}
-      {tab === "spending" && (
-        <div style={S.page}>
-          <div className="sec">Spending</div>
-          {spendingEnvelopes.length === 0 ? (
-            <div className="card" style={{padding:28,textAlign:"center"}}>
-              <div style={{fontSize:36,marginBottom:10}}>▤</div>
-              <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No spending envelopes</div>
-              <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
-                Add a Spending envelope for a category like groceries or gas. You'll see each
-                month's plan against what you actually spent.
+          {insightsView === "spending" && (
+            spendingEnvelopes.length === 0 ? (
+              <div className="card" style={{padding:28,textAlign:"center"}}>
+                <div style={{fontSize:36,marginBottom:10}}>▤</div>
+                <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No spending envelopes</div>
+                <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                  Add a Spending envelope for a category like groceries or gas. You'll see each
+                  month's plan against what you actually spent.
+                </div>
+                <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.SPENDING})}>Add Spending</button>
               </div>
-              <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.SPENDING})}>Add Spending</button>
-            </div>
-          ) : (
-            <SpendingView envelopes={spendingEnvelopes} transactions={transactions}
-              onOpen={env=>setDetailEnv(env)} />
+            ) : (
+              <SpendingView envelopes={spendingEnvelopes} transactions={transactions}
+                onOpen={env=>setDetailEnv(env)} />
+            )
+          )}
+
+          {insightsView === "debt" && (
+            debts.length === 0 ? (
+              <div className="card" style={{padding:28,textAlign:"center"}}>
+                <div style={{fontSize:36,marginBottom:10}}>◐</div>
+                <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No debts tracked</div>
+                <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                  Add a Debt envelope to watch a credit card or loan drop toward zero — with a
+                  suggested payment and a warning if a 0% period is running out.
+                </div>
+                <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.DEBT})}>Track a Debt</button>
+              </div>
+            ) : (
+              <>
+                <div className="card" style={{padding:"16px 18px",marginBottom:16,display:"flex"}}>
+                  {[
+                    ["Total owed", money(debts.reduce((s,e)=>s+(e.currentBalance||0),0)), "#fff"],
+                    ["Paid off", money(debts.reduce((s,e)=>s+Math.max(0,(e.originalBalance||0)-(e.currentBalance||0)),0)), "#30d158"],
+                    ["Suggested/mo", money(debts.reduce((s,e)=>s+suggestedPayment(e),0)), "#c5f135"],
+                  ].map(([label,val,color],i)=>(
+                    <div key={i} style={{flex:1,textAlign:i===0?"left":i===1?"center":"right"}}>
+                      <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:500,marginBottom:4}}>{label}</div>
+                      <div style={{fontSize:18,fontWeight:700,letterSpacing:"-.8px",color}}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  {debts.map(env => <DebtCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
+                </div>
+              </>
+            )
+          )}
+
+          {insightsView === "income" && (
+            <IncomeView transactions={transactions} onOpenTx={tx=>setTxDetail(tx)} />
           )}
         </div>
       )}
@@ -992,7 +1005,7 @@ export default function App() {
       )}
 
       <div className="tabbar">
-        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["spending","▤","Spending"],["activity","≡","Activity"]].map(([t,ic,l])=>(
+        {[["home","⊞","Home"],["envelopes","▣","Envelopes"],["bills","◎","Bills"],["activity","≡","Activity"],["insights","◔","Insights"]].map(([t,ic,l])=>(
           <button key={t} onClick={()=>setTab(t)} className={`tb ${tab===t?"on":""}`}>
             <span style={{fontSize:21}}>{ic}</span>{l}
           </button>
@@ -2919,7 +2932,7 @@ button{-webkit-tap-highlight-color:transparent}
 .lock-btn:active{background:#3a3a3c}
 
 .tabs{display:flex;border-bottom:.5px solid rgba(255,255,255,.1);margin-top:18px}
-.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:8.5px;font-weight:500;letter-spacing:.1px;text-transform:uppercase;font-family:inherit;transition:color .15s}
+.tab{flex:1;background:none;border:none;border-bottom:2px solid transparent;padding-bottom:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:#636366;font-size:9.5px;font-weight:500;letter-spacing:.3px;text-transform:uppercase;font-family:inherit;transition:color .15s}
 .tab.on{color:#c5f135;border-bottom-color:#c5f135}
 
 .tabbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:rgba(0,0,0,.85);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-top:.5px solid rgba(255,255,255,.1);display:flex;padding:10px 0 28px;z-index:40}
