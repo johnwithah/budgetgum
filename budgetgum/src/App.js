@@ -2319,9 +2319,41 @@ function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
         </div>
         <div style={{textAlign:"right"}}>
           <div style={{fontSize:15,fontWeight:600}}>{money(amt)}</div>
-          {!paid && (env.funded||0)>0 && <div style={{fontSize:11,color:"#8e8e93",marginTop:1}}>{money(env.funded)} ready</div>}
         </div>
       </div>
+
+      {/* Funding progress — how full is this envelope vs. what's due.
+          Makes the "is this covered yet" state visible at a glance. */}
+      {!paid && amt > 0 && (() => {
+        const funded = env.funded || 0;
+        const pct = Math.min(100, (funded / amt) * 100);
+        const short = Math.max(0, amt - funded);
+        const ready = short <= 0.005;
+        return (
+          <div style={{marginTop:10}}>
+            <div className="bar" style={{height:5}}>
+              <div className="fill" style={{width:`${pct}%`,
+                background: ready ? "#30d158" : locked ? "#ffd60a" : "#c5f135"}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",marginTop:5}}>
+              <span style={{fontSize:11,color:ready?"#30d158":"#8e8e93",fontWeight:500}}>
+                {ready ? "Fully funded ✓" : `${money(funded)} of ${money(amt)} set aside`}
+              </span>
+              {!ready && <span style={{fontSize:11,color:"#8e8e93"}}>{money(short)} to go</span>}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Manual split reminder, if you've flagged one on this envelope */}
+      {(env.flagAmount != null || env.flagLabel) && !paid && (
+        <div style={{marginTop:9,display:"flex",alignItems:"center",gap:6,
+                     background:"#2c2c2e",borderRadius:8,padding:"6px 10px"}}>
+          <span style={{fontSize:11}}>🔖</span>
+          {env.flagLabel && <span style={{fontSize:11.5,color:"#8e8e93",flex:1}}>{env.flagLabel}</span>}
+          {env.flagAmount != null && <span style={{fontSize:12,fontWeight:700,color:"#64d2ff"}}>{money(env.flagAmount)}</span>}
+        </div>
+      )}
       {!paid && (
         <div style={{display:"flex",gap:8,marginTop:11}}>
           {env.paymentUrl && (
