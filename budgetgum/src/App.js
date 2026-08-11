@@ -1893,6 +1893,20 @@ function SpendingView({ envelopes, transactions, onOpen }) {
   );
 }
 
+// A small manual reminder tag — "Sydney owes $100" — shown on cards and detail.
+// Purely something you typed; no math behind it.
+function FlagTag({ env, style }) {
+  if (env.flagAmount == null && !env.flagLabel) return null;
+  return (
+    <div style={{marginTop:8,background:"#2c2c2e",borderRadius:8,padding:"5px 9px",
+                 display:"inline-flex",alignItems:"center",gap:6,maxWidth:"100%",...style}}>
+      <span style={{fontSize:10}}>🔖</span>
+      {env.flagLabel && <span style={{fontSize:11,color:"#8e8e93",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{env.flagLabel}</span>}
+      {env.flagAmount != null && <span style={{fontSize:11.5,fontWeight:700,color:"#64d2ff"}}>{money(env.flagAmount)}</span>}
+    </div>
+  );
+}
+
 function EnvCard({ env, transactions, onClick }) {
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
@@ -1932,6 +1946,7 @@ function EnvCard({ env, transactions, onClick }) {
               ? `Fully funded for ${monthLabel} ✓`
               : `of ${money(plan)} · ${money(gap)} to go`}
         </div>
+        <FlagTag env={env} />
       </button>
     );
   }
@@ -1973,6 +1988,7 @@ function EnvCard({ env, transactions, onClick }) {
           <span style={{fontSize:9.5,color:"#8e8e93"}}>set aside</span>
         </div>
       )}
+      <FlagTag env={env} />
     </button>
   );
 }
@@ -2383,6 +2399,7 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
     autopay: initial.autopay || false, autopayLeadDays: initial.autopayLeadDays ?? 5,
     id: initial.id, matchPatterns: initial.matchPatterns || [],
     website: initial.website || "", logoUrl: initial.logoUrl || "",
+    note: initial.note || "", flagLabel: initial.flagLabel || "", flagAmount: initial.flagAmount ?? "",
   });
   const set = (k,v) => setF(p => ({...p,[k]:v}));
   const bill = isBill(f.type);
@@ -2398,6 +2415,8 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   function save() {
     if (!f.name.trim()) return;
     onSave({ ...f, name: f.name.trim(), website: f.website.trim(),
+      note: f.note.trim(), flagLabel: f.flagLabel.trim(),
+      flagAmount: f.flagAmount === "" ? null : (parseFloat(f.flagAmount) || 0),
       monthlyBudget: parseFloat(f.monthlyBudget)||0, billAmount: parseFloat(f.billAmount)||0,
       currentBalance: parseFloat(f.currentBalance)||0, targetAmount: parseFloat(f.targetAmount)||0,
       minimumPayment: parseFloat(f.minimumPayment)||0, postPromoAPR: parseFloat(f.postPromoAPR)||0,
@@ -2525,6 +2544,25 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
         </>
       )}
 
+      {/* Notes + an optional amount to surface on the card. Built for the
+          irregular stuff structured fields can't hold — "Sydney owes ~$100 of
+          the cruise," "she usually covers ~$40 of utilities." All manual. */}
+      <Label style={{marginTop:16}}>Note <Dim>(optional)</Dim></Label>
+      <textarea className="in" value={f.note} onChange={e=>set("note",e.target.value)}
+        placeholder="e.g. Of $650: $500 from Sydney, $150 mine"
+        style={{height:64,resize:"vertical",lineHeight:1.4,paddingTop:11}} />
+
+      <Label style={{marginTop:14}}>Flag an amount to remember <Dim>(optional)</Dim></Label>
+      <div style={{fontSize:11.5,color:"#8e8e93",lineHeight:1.5,marginBottom:8}}>
+        Shows as a tag on the envelope card — handy for "who owes me what."
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <input className="in" value={f.flagLabel} onChange={e=>set("flagLabel",e.target.value)}
+          placeholder="Sydney owes" style={{flex:1.4}} autoCapitalize="words" />
+        <input className="in" type="number" value={f.flagAmount} onChange={e=>set("flagAmount",e.target.value)}
+          placeholder="100" style={{flex:1}} />
+      </div>
+
       <Label style={{marginTop:16}}>Logo <Dim>(optional)</Dim></Label>
       <div className="card" style={{padding:13,marginBottom:6}}>
         <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}>
@@ -2582,6 +2620,23 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
         {paid && <div style={{display:"inline-block",marginTop:8,background:"#30d15822",color:"#30d158",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:700}}>✓ PAID THIS PERIOD</div>}
         {locked && <div style={{display:"inline-block",marginTop:8,marginLeft:6,background:"#ffd60a22",color:"#ffd60a",borderRadius:20,padding:"4px 12px",fontSize:12,fontWeight:700}}>🔒 LOCKED</div>}
       </div>
+
+      {/* Manual note + flag — the shared-expense reminders you typed in */}
+      {(env.note || env.flagAmount != null || env.flagLabel) && (
+        <div className="card" style={{padding:14,marginBottom:12,border:"1px solid #64d2ff22"}}>
+          {(env.flagAmount != null || env.flagLabel) && (
+            <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:env.note?10:0,
+                         paddingBottom:env.note?10:0,borderBottom:env.note?".5px solid rgba(255,255,255,.07)":"none"}}>
+              <span style={{fontSize:14}}>🔖</span>
+              {env.flagLabel && <span style={{fontSize:13.5,color:"#aeaeb2",flex:1}}>{env.flagLabel}</span>}
+              {env.flagAmount != null && <span style={{fontSize:16,fontWeight:700,color:"#64d2ff",letterSpacing:"-.3px"}}>{money(env.flagAmount)}</span>}
+            </div>
+          )}
+          {env.note && (
+            <div style={{fontSize:13.5,color:"#c7c7cc",lineHeight:1.5,whiteSpace:"pre-wrap"}}>{env.note}</div>
+          )}
+        </div>
+      )}
 
       {env.type === TYPES.DEBT && (
         <>
