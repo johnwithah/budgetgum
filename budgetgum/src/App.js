@@ -5,7 +5,7 @@ import {
   TYPES, TYPE_META, isBill, hasTarget,
   nextDueDate, lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
-  spendingHistory, fundingGap, spentInMonth,
+  spentInMonth,
   billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
@@ -99,10 +99,7 @@ export default function App() {
 
   // Thin wrappers so every existing call site still reads naturally.
   const setEnvelopes    = useCallback(u => setState(s => ({...s, envelopes:    typeof u==="function" ? u(s.envelopes)    : u})), [setState]);
-  const setTransactions = useCallback(u => setState(s => ({...s, transactions: typeof u==="function" ? u(s.transactions) : u})), [setState]);
   const setAccounts     = useCallback(u => setState(s => ({...s, accounts:     typeof u==="function" ? u(s.accounts)     : u})), [setState]);
-  const setUnmapped     = useCallback(u => setState(s => ({...s, unmapped:     typeof u==="function" ? u(s.unmapped)     : u})), [setState]);
-  const setLastSync     = useCallback(v => setState(s => ({...s, lastSync: v})), [setState]);
 
   const [tab, setTab] = useState("home");
   const [syncing, setSyncing] = useState(false);
@@ -113,7 +110,7 @@ export default function App() {
   const [mapTx, setMapTx] = useState(null);
   const [txDetail, setTxDetail] = useState(null);   // a sorted transaction being viewed/edited
   const [activityView, setActivityView] = useState("all");   // all | income
-  const [insightsView, setInsightsView] = useState("spending");   // spending | debt | income
+  const [insightsView, setInsightsView] = useState("spending");   // spending | debt | goals | income
   const [settings, setSettings] = useState(false);
 
   const checkingBalance = useMemo(
@@ -127,6 +124,7 @@ export default function App() {
   const locks  = useMemo(() => upcomingLocks(envelopes, transactions), [envelopes, transactions]);
   const bills  = envelopes.filter(e => isBill(e.type));
   const debts  = envelopes.filter(e => e.type === TYPES.DEBT);
+  const goals  = envelopes.filter(e => e.type === TYPES.GOAL);
 
   // ── Home is a "where should my money go?" screen ──────────────────────────
   // Spending envelopes (the discretionary ones) go up top; then the bills that
@@ -874,13 +872,12 @@ export default function App() {
         </div>
       )}
 
-      {/* ═══ DEBT PAYOFF ═══ */}
-      {/* ═══ INSIGHTS — reports live here: Spending · Debt · Income ═══ */}
+      {/* ═══ INSIGHTS — reports live here: Spending · Debt · Goals · Income ═══ */}
       {tab === "insights" && (
         <div style={S.page}>
           <div className="sec">Insights</div>
           <div style={{display:"flex",gap:6,background:"#1c1c1e",borderRadius:11,padding:4,marginBottom:16}}>
-            {[["spending","Spending"],["debt","Debt"],["income","Income"]].map(([v,label])=>(
+            {[["spending","Spending"],["debt","Debt"],["goals","Goals"],["income","Income"]].map(([v,label])=>(
               <button key={v} onClick={()=>setInsightsView(v)}
                 style={{flex:1,background:insightsView===v?"#2c2c2e":"transparent",color:insightsView===v?"#fff":"#8e8e93",
                         border:"none",borderRadius:8,padding:"8px 0",fontSize:13.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
@@ -933,6 +930,38 @@ export default function App() {
                 </div>
                 <div style={{display:"flex",flexDirection:"column",gap:10}}>
                   {debts.map(env => <DebtCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
+                </div>
+              </>
+            )
+          )}
+
+          {insightsView === "goals" && (
+            goals.length === 0 ? (
+              <div className="card" style={{padding:28,textAlign:"center"}}>
+                <div style={{fontSize:36,marginBottom:10}}>🎯</div>
+                <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>No goals yet</div>
+                <div style={{fontSize:13,color:"#636366",lineHeight:1.5,marginBottom:16}}>
+                  Add a Goal envelope to save up for something by a date — a cruise, a laptop,
+                  an emergency fund — with a suggested amount to stay on pace.
+                </div>
+                <button className="btn-green" onClick={()=>setEditEnv({type:TYPES.GOAL})}>Add a Goal</button>
+              </div>
+            ) : (
+              <>
+                <div className="card" style={{padding:"16px 18px",marginBottom:16,display:"flex"}}>
+                  {[
+                    ["Total saved", money(goals.reduce((s,e)=>s+(e.currentBalance||0),0)), "#fff"],
+                    ["Total target", money(goals.reduce((s,e)=>s+(e.targetAmount||0),0)), "#8e8e93"],
+                    ["Suggested/mo", money(goals.reduce((s,e)=>s+suggestedPayment(e),0)), "#c5f135"],
+                  ].map(([label,val,color],i)=>(
+                    <div key={i} style={{flex:1,textAlign:i===0?"left":i===1?"center":"right"}}>
+                      <div style={{fontSize:11.5,color:"#8e8e93",fontWeight:500,marginBottom:4}}>{label}</div>
+                      <div style={{fontSize:18,fontWeight:700,letterSpacing:"-.8px",color}}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  {goals.map(env => <GoalCard key={env.id} env={env} onClick={()=>setDetailEnv(env)} />)}
                 </div>
               </>
             )
@@ -2418,6 +2447,62 @@ function DebtCard({ env, onClick }) {
   );
 }
 
+// Same shape as DebtCard, opposite direction: building UP to a target instead
+// of paying DOWN to zero. "Days left" replaces schedule variance — goals don't
+// have a starting balance to pace against, just a deadline.
+function GoalCard({ env, onClick }) {
+  const pct = progress(env);
+  const sugg = suggestedPayment(env);
+  const target = env.targetAmount || 0;
+  const saved = env.currentBalance || 0;
+  const remaining = Math.max(0, target - saved);
+  const reached = target > 0 && remaining <= 0;
+  const due = env.targetDate ? new Date(env.targetDate + "T00:00:00") : null;
+  const daysLeft = due ? daysBetween(new Date(), due) : null;
+
+  return (
+    <button className="card" onClick={onClick} style={{padding:17,textAlign:"left",width:"100%",border:reached?"1px solid #30d15844":"none"}}>
+      <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:13}}>
+        <EnvIcon env={env} size={42} radius={12} bg={env.color+"22"} />
+        <div style={{flex:1}}>
+          <div style={{fontSize:16,fontWeight:600}}>{env.name}</div>
+          <div style={{fontSize:12,color:"#636366",marginTop:1}}>
+            {due ? `Target ${due.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}` : "No target date"}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:20,fontWeight:700,letterSpacing:"-.8px"}}>{money(saved)}</div>
+          <div style={{fontSize:11,color:"#48484a"}}>of {money(target)}</div>
+        </div>
+      </div>
+      <div className="bar" style={{height:7,marginBottom:8}}>
+        <div className="fill" style={{width:`${pct}%`,background:`linear-gradient(90deg,${env.color},#c5f135)`}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:12}}>
+        <span style={{color:env.color,fontWeight:600}}>{Math.round(pct)}% saved</span>
+        {daysLeft !== null && (
+          <span style={{color:reached?"#30d158":daysLeft<0?"#ff453a":"#8e8e93",fontWeight:600}}>
+            {reached ? "Goal reached 🎉" : daysLeft<0 ? `${Math.abs(daysLeft)} days past target` : `${daysLeft} days left`}
+          </span>
+        )}
+      </div>
+      {reached ? (
+        <div style={{background:"#0f2a17",borderRadius:10,padding:"10px 12px",textAlign:"center",fontSize:13,fontWeight:600,color:"#30d158"}}>
+          Fully funded — you're there
+        </div>
+      ) : (
+        <div style={{background:"#2c2c2e",borderRadius:10,padding:"10px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:11,color:"#8e8e93"}}>Suggested {env.frequency||"monthly"}</div>
+            <div style={{fontSize:17,fontWeight:700,letterSpacing:"-.5px",color:"#c5f135"}}>{money(sugg)}</div>
+          </div>
+          <div style={{fontSize:11,color:"#48484a",textAlign:"right",maxWidth:130,lineHeight:1.4}}>{money(remaining)} to go</div>
+        </div>
+      )}
+    </button>
+  );
+}
+
 function EnvelopeForm({ initial, onSave, onCancel }) {
   const [f, setF] = useState({
     type: initial.type || TYPES.SPENDING,
@@ -2713,6 +2798,41 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
         </>
       )}
 
+      {env.type === TYPES.GOAL && (() => {
+        const pct = progress(env);
+        const target = env.targetAmount || 0;
+        const saved = env.currentBalance || 0;
+        const remaining = Math.max(0, target - saved);
+        const reached = target > 0 && remaining <= 0;
+        const due = env.targetDate ? new Date(env.targetDate + "T00:00:00") : null;
+        const daysLeft = due ? daysBetween(new Date(), due) : null;
+        return (
+          <div className="card" style={{padding:16,marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+              <div>
+                <div style={{fontSize:11,color:"#8e8e93",textTransform:"uppercase",letterSpacing:".4px"}}>Saved</div>
+                <div style={{fontSize:28,fontWeight:700,letterSpacing:"-1.2px"}}>{money(saved)}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:11,color:"#8e8e93"}}>Target</div>
+                <div style={{fontSize:15,color:"#8e8e93"}}>{money(target)}</div>
+              </div>
+            </div>
+            <div className="bar" style={{height:8,marginBottom:8}}>
+              <div className="fill" style={{width:`${pct}%`,background:`linear-gradient(90deg,${env.color},#c5f135)`}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12.5}}>
+              <span style={{color:env.color,fontWeight:600}}>{Math.round(pct)}% saved</span>
+              {daysLeft !== null && (
+                <span style={{color:reached?"#30d158":daysLeft<0?"#ff453a":"#8e8e93",fontWeight:600}}>
+                  {reached ? "Goal reached 🎉" : daysLeft<0 ? `${Math.abs(daysLeft)} days past target` : `${daysLeft} days left`}
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       <div className="grp" style={{marginBottom:12}}>
         {isBill(env.type) && (
           <>
@@ -2743,9 +2863,8 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
         })()}
         {env.type === TYPES.GOAL && (
           <>
-            <DRow k="Saved" v={money(env.currentBalance||0)} accent />
-            <DRow k="Target" v={money(env.targetAmount)} />
-            <DRow k="Suggested" v={money(suggestedPayment(env))} />
+            <DRow k="Suggested" v={money(suggestedPayment(env))} accent />
+            <DRow k="Set aside" v={money(env.funded||0)} />
           </>
         )}
       </div>
