@@ -331,17 +331,17 @@ export default function App() {
     let next = { ...env };
     if (env.type === TYPES.DEBT)      next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
     else if (env.type === TYPES.GOAL) next.currentBalance = (env.currentBalance || 0) + total;
-    if (isBill(env.type)) next.funded = 0;
+    // Release only what this payment consumed — any surplus you funded ahead
+    // of the bill (a deliberate buffer toward next period) survives.
+    if (isBill(env.type)) next.funded = Math.max(0, (env.funded || 0) - total);
     return next;
   }
 
   // ── The MIRROR of applyPayments ────────────────────────────────────────────
   // Undoing a payment has to reverse exactly what applying it did, or balances
-  // drift silently. A debt balance goes back UP, a goal comes back DOWN. The
-  // funded/paid side is trickier: settling a bill zeroed `funded` and left no
-  // record of what it was, so we can't perfectly restore the old reservation.
-  // Reversing the balance is the part that must be right (it's what corrupts
-  // your payoff math); the funded reset is cosmetic and self-heals next period.
+  // drift silently. A debt balance goes back UP, a goal comes back DOWN, and a
+  // bill's funded amount goes back UP by the same `total` that applyPayments
+  // subtracted — an exact reversal, since the subtraction was non-lossy.
   function unapplyPayments(env, payments) {
     if (!payments.length) return env;
 
@@ -358,7 +358,10 @@ export default function App() {
     else if (env.type === TYPES.GOAL) next.currentBalance = Math.max(0, (env.currentBalance || 0) - total);
     // Clear any manual "paid" override for this period — removing the payment
     // means it may no longer be paid, and isPaid() will recompute from what's left.
-    if (isBill(env.type)) next.manualPaidPeriod = null;
+    if (isBill(env.type)) {
+      next.manualPaidPeriod = null;
+      next.funded = (env.funded || 0) + total;
+    }
     return next;
   }
 
