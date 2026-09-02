@@ -268,7 +268,7 @@ export function prevDueDate(env, due) {
 // manual, missed }]. `missed` = a past period with no payment and no manual
 // confirmation — the one state that deserves attention.
 // ═════════════════════════════════════════════════════════════════════════════
-export function paymentHistory(env, transactions, count = 6, dataSince = null) {
+export function paymentHistory(env, transactions, count = 6, dataSince = null, extraKeys = []) {
   if (!isBill(env.type)) return [];
   const today = startOfDay();
   const manualSet = new Set([
@@ -292,10 +292,7 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null) {
   // reporting them as "missed" would be a false alarm.
   const floor = dataSince ? startOfDay(new Date(dataSince + "T00:00:00")) : null;
 
-  const out = [];
-  let due = nextDueDate(env);
-  for (let i = 0; i < count && due; i++) {
-    const key = keyOf(due);
+  const buildEntry = (due, key) => {
     const hits = byPeriod.get(key) || [];
     const amount = hits.reduce((s, t) => s + t.amount, 0);
     const paidDate = hits.length ? hits.map(t => t.date).sort().slice(-1)[0] : null;
@@ -305,7 +302,7 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null) {
     const isPast = due < today;                    // due date has passed
     const noData = Boolean(floor && due < floor);  // predates our data
 
-    out.push({
+    return {
       key,
       dueDate: due,
       label: due.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
@@ -317,11 +314,29 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null) {
       noData,
       missed: isPast && !paid && !noData,
       upcoming: !isPast,
-    });
+    };
+  };
 
+  const out = [];
+  const seen = new Set();
+  let due = nextDueDate(env);
+  for (let i = 0; i < count && due; i++) {
+    const key = keyOf(due);
+    out.push(buildEntry(due, key));
+    seen.add(key);
     due = prevDueDate(env, due);
   }
-  return out;
+
+  // A period outside the normal lookback can still matter — e.g. an unresolved
+  // per-period note. Don't let it silently vanish just because it's old.
+  extraKeys.filter(k => k && !seen.has(k)).forEach(key => {
+    const d = startOfDay(new Date(key + "T00:00:00"));
+    if (isNaN(d.getTime())) return;
+    out.push(buildEntry(d, key));
+    seen.add(key);
+  });
+
+  return out.sort((a, b) => b.dueDate - a.dueDate);
 }
 
 // ── Spending envelopes: how much of this month's budget is gone? ─────────────

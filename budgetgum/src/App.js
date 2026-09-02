@@ -591,6 +591,32 @@ export default function App() {
     showToast("Marked paid");
   }
 
+  // Per-period reminders (e.g. "Sydney owes $71") — keyed the same way as
+  // manualPaidPeriods, but carrying text instead of a boolean. Saving empty
+  // text removes the entry; a non-empty save preserves whatever `cleared`
+  // state was already there.
+  function setPeriodNote(env, key, text) {
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const notes = { ...(e.periodNotes || {}) };
+      const trimmed = text.trim();
+      if (!trimmed) delete notes[key];
+      else notes[key] = { text: trimmed, cleared: notes[key]?.cleared || false };
+      return { ...e, periodNotes: notes };
+    }));
+  }
+
+  // Resolving a note is distinct from deleting it — "cleared" just stops it
+  // from surfacing as an active reminder; the text is still there to reopen.
+  function togglePeriodNoteCleared(env, key) {
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const cur = e.periodNotes?.[key];
+      if (!cur) return e;
+      return { ...e, periodNotes: { ...e.periodNotes, [key]: { ...cur, cleared: !cur.cleared } } };
+    }));
+  }
+
   async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
   async function logout() {
     await api("/api/logout").catch(()=>{});
@@ -1062,6 +1088,8 @@ export default function App() {
                       onMarkPaid={()=>markPaid(detailEnv)}
                       onMarkPeriodPaid={markPeriodPaid}
                       onUnmarkPeriod={unmarkPaid}
+                      onSetPeriodNote={setPeriodNote}
+                      onTogglePeriodNoteCleared={togglePeriodNoteCleared}
                       onUpdateAmount={updateBillAmount}
                       onToggleAutoAmount={toggleAutoAmount} />}
       {fundEnv   && <FundSheet env={envelopes.find(e=>e.id===fundEnv.id)} sts={sts} transactions={transactions}
@@ -2284,6 +2312,7 @@ function PaidBillRow({ env, transactions, onOpen }) {
   const manual = actual <= 0;   // paid via manual mark, no cleared transaction
   const hist = paymentHistory(env, transactions, 2);
   const paidDate = hist[0]?.paidDate;
+  const periodNote = env.periodNotes?.[periodKey(env)];
 
   return (
     <button className="card row-tap" onClick={onOpen}
@@ -2301,6 +2330,16 @@ function PaidBillRow({ env, transactions, onOpen }) {
           <div style={{fontSize:10.5,color:"#8e8e93"}}>{manual ? "confirmed" : "cleared"}</div>
         </div>
       </div>
+
+      {/* Per-period reminder — stays visible after the bill is paid, since
+          that's the whole point (e.g. "Sydney owes $71"). */}
+      {periodNote && !periodNote.cleared && (
+        <div style={{marginTop:9,display:"flex",alignItems:"center",gap:6,
+                     background:"#2c2c2e",borderRadius:8,padding:"6px 10px"}}>
+          <span style={{fontSize:11}}>🔖</span>
+          <span style={{fontSize:11.5,color:"#8e8e93",flex:1}}>{periodNote.text}</span>
+        </div>
+      )}
     </button>
   );
 }
@@ -2313,6 +2352,7 @@ function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
   const amt = targetAmount(env);
   const actual = paidThisPeriod(env, transactions);
   const overdue = paid ? null : overdueInfo(env, transactions, dataSince);
+  const periodNote = env.periodNotes?.[periodKey(env)];
   const urg = overdue ? "#ff375f" : days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
   return (
     <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1,
@@ -2384,6 +2424,16 @@ function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
           <span style={{fontSize:11}}>🔖</span>
           {env.flagLabel && <span style={{fontSize:11.5,color:"#8e8e93",flex:1}}>{env.flagLabel}</span>}
           {env.flagAmount != null && <span style={{fontSize:12,fontWeight:700,color:"#64d2ff"}}>{money(env.flagAmount)}</span>}
+        </div>
+      )}
+
+      {/* Per-period reminder for this bill's current period — stays visible
+          after payment, since that's the whole point (e.g. "Sydney owes $71"). */}
+      {periodNote && !periodNote.cleared && (
+        <div style={{marginTop:9,display:"flex",alignItems:"center",gap:6,
+                     background:"#2c2c2e",borderRadius:8,padding:"6px 10px"}}>
+          <span style={{fontSize:11}}>🔖</span>
+          <span style={{fontSize:11.5,color:"#8e8e93",flex:1}}>{periodNote.text}</span>
         </div>
       )}
       {!paid && (
@@ -2720,14 +2770,21 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod, onUpdateAmount, onToggleAutoAmount }) {
+function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod, onSetPeriodNote, onTogglePeriodNoteCleared, onUpdateAmount, onToggleAutoAmount }) {
   const [confirmDel, setConfirmDel] = useState(false);
+  const [editingNoteKey, setEditingNoteKey] = useState(null);
+  const [noteDraft, setNoteDraft] = useState("");
   const locked = isLocked(env, transactions);
   const paid = isPaid(env, transactions);
   const risk = promoRisk(env);
   const variance = scheduleVariance(env);
   const due = nextDueDate(env);
   const lock = lockDate(env);
+  // Unresolved notes must stay visible even if their period has aged past the
+  // normal lookback window — paymentHistory() folds these in as extra rows.
+  const openNoteKeys = Object.entries(env.periodNotes || {})
+    .filter(([, v]) => v && v.text && !v.cleared)
+    .map(([k]) => k);
 
   return (
     <Sheet onClose={onClose} title={null}>
@@ -2942,8 +2999,12 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
 
           <Label style={{marginTop:14}}>Payment history</Label>
           <div className="grp" style={{marginBottom:12}}>
-            {paymentHistory(env, transactions, 6, dataSince).map(p => (
-              <div key={p.key} className="row" style={{padding:"11px 14px"}}>
+            {paymentHistory(env, transactions, 6, dataSince, openNoteKeys).map(p => {
+              const note = env.periodNotes?.[p.key];
+              const editingNote = editingNoteKey === p.key;
+              return (
+              <div key={p.key} className="row" style={{display:"block",padding:"11px 14px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:11}}>
                 <div style={{width:26,height:26,borderRadius:8,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,
                   background:p.paid?"#30d15826":p.noData?"#2c2c2e":p.missed?"#ff375f26":"#2c2c2e",
                   color:p.paid?"#30d158":p.noData?"#48484a":p.missed?"#ff375f":"#8e8e93"}}>
@@ -2968,8 +3029,35 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
                         ? <button className="btn-mini" style={{padding:"5px 10px",fontSize:12,color:"#8e8e93"}} onClick={()=>onUnmarkPeriod(env, p.key)}>Undo</button>
                         : <span style={{fontSize:12,color:"#48484a"}}>—</span>}
                 </div>
+                </div>
+
+                {/* Per-period reminder — "Sydney owes $71" — persists across paid state */}
+                {editingNote ? (
+                  <div style={{display:"flex",gap:6,marginTop:9}}>
+                    <input className="in" autoFocus value={noteDraft} onChange={e=>setNoteDraft(e.target.value)}
+                      placeholder="e.g. Sydney owes $71" style={{flex:1,fontSize:12.5,padding:"7px 10px"}} />
+                    <button className="btn-mini" style={{flex:"none",padding:"7px 12px",fontSize:12}}
+                      onClick={()=>{ onSetPeriodNote(env, p.key, noteDraft); setEditingNoteKey(null); }}>Save</button>
+                    <button className="btn-mini" style={{flex:"none",padding:"7px 12px",fontSize:12,color:"#8e8e93"}}
+                      onClick={()=>setEditingNoteKey(null)}>Cancel</button>
+                  </div>
+                ) : note && note.text ? (
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginTop:9,background:"#2c2c2e",borderRadius:8,padding:"6px 10px"}}>
+                    <span style={{fontSize:11}}>🔖</span>
+                    <span style={{fontSize:12,flex:1,minWidth:0,color:note.cleared?"#636366":"#c7c7cc",
+                      textDecoration:note.cleared?"line-through":"none"}}>{note.text}</span>
+                    <button className="link" style={{fontSize:11}}
+                      onClick={()=>{ setEditingNoteKey(p.key); setNoteDraft(note.text); }}>Edit</button>
+                    <button className="link" style={{fontSize:11}}
+                      onClick={()=>onTogglePeriodNoteCleared(env, p.key)}>{note.cleared?"Reopen":"Clear"}</button>
+                  </div>
+                ) : (
+                  <button className="link" style={{fontSize:11,marginTop:7}}
+                    onClick={()=>{ setEditingNoteKey(p.key); setNoteDraft(""); }}>+ Note</button>
+                )}
               </div>
-            ))}
+              );
+            })}
           </div>
         </>
       )}
