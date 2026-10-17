@@ -208,10 +208,47 @@ export function dueDateOptions(env, aroundDate, back = 2, forward = 2) {
   return out;
 }
 
-// Total credited to the current billing period.
-export function paidThisPeriod(env, transactions) {
+// ═════════════════════════════════════════════════════════════════════════════
+// THE ACTIVE PERIOD — which bill are you actually working on right now?
+//
+// `nextDueDate` is pure schedule math: it always rolls FORWARD the moment a due
+// date passes. On its own that means an unpaid October bill silently becomes a
+// November bill on October 16th — the envelope you funded for October now reads
+// as funding November, and October disappears without ever being settled.
+//
+// So "the current period" is not "the next due date." It's the OLDEST period
+// that hasn't been settled yet. The schedule only advances once October is
+// actually done — a payment cleared, or you marked it paid by hand. Until then
+// every question the app asks of this envelope ("is it paid?", "what's it
+// funded for?", "which period does this note belong to?") is about October.
+//
+// Two guards keep this from pinning an envelope to the distant past:
+//   • `dataSince` — periods older than the imported transaction window can't be
+//     judged, so they never count as unsettled (same floor `paymentHistory`
+//     uses for `missed`).
+//   • `SETTLE_LOOKBACK` — we only ever look a few periods back. A bill ignored
+//     for half a year shouldn't drag the whole envelope to last spring; the
+//     overdue alert is what speaks up about that.
+// ═════════════════════════════════════════════════════════════════════════════
+export const SETTLE_LOOKBACK = 3;
+
+export function activeDueDate(env, transactions = [], dataSince = null) {
+  const next = nextDueDate(env);
+  if (!next || !isBill(env.type)) return next;
+
+  // paymentHistory walks back from nextDueDate and already knows what "missed"
+  // means (past, nothing cleared, no manual mark, and inside our data window).
+  const unsettled = paymentHistory(env, transactions, SETTLE_LOOKBACK + 1, dataSince)
+    .filter(p => p.missed)
+    .sort((a, b) => a.dueDate - b.dueDate);   // oldest first
+
+  return unsettled.length ? unsettled[0].dueDate : next;
+}
+
+// Total credited to the active billing period.
+export function paidThisPeriod(env, transactions, dataSince = null) {
   if (!isBill(env.type)) return 0;
-  const current = periodKey(env);
+  const current = periodKey(env, transactions, dataSince);
   return transactions
     .filter(t => t.envelopeId === env.id)
     .filter(t => t.amount > 0)   // outflows only; ignore refunds/inflows
@@ -225,19 +262,20 @@ export function paidThisPeriod(env, transactions) {
 // Manual confirmations are stored per-period in `manualPaidPeriods` (an array of
 // due-date keys). We also honor the legacy single `manualPaidPeriod` field so
 // envelopes created before the archive existed still read correctly.
-export function isPaid(env, transactions) {
+export function isPaid(env, transactions, dataSince = null) {
   if (!isBill(env.type)) return false;
-  const key = periodKey(env);
+  const key = periodKey(env, transactions, dataSince);
   if ((env.manualPaidPeriods || []).includes(key)) return true;
   if (env.manualPaidPeriod === key) return true;   // legacy
-  return paidThisPeriod(env, transactions) > 0;
+  return paidThisPeriod(env, transactions, dataSince) > 0;
 }
 
-// A stable string identifying the current period, so a manual "mark paid"
-// can be scoped to it and expire naturally.
-export function periodKey(env) {
-  const next = nextDueDate(env);
-  return next ? next.toISOString().split("T")[0] : "";
+// A stable string identifying the ACTIVE period, so a manual "mark paid" is
+// scoped to the bill you're actually looking at — not to whatever month the
+// raw schedule has already rolled on to.
+export function periodKey(env, transactions = [], dataSince = null) {
+  const due = activeDueDate(env, transactions, dataSince);
+  return due ? due.toISOString().split("T")[0] : "";
 }
 
 // Step a due date back exactly one period. Used to walk history backwards.
@@ -268,6 +306,42 @@ export function prevDueDate(env, due) {
 // manual, missed }]. `missed` = a past period with no payment and no manual
 // confirmation — the one state that deserves attention.
 // ═════════════════════════════════════════════════════════════════════════════
+// How far back can this envelope fairly be judged? Two floors, whichever is
+// later:
+//   • `dataSince` — the app simply has no bank data before this.
+//   • the envelope's own birthday — a bill you added last Tuesday was not
+//     "missed" in August, and must not drag the active period into the past.
+// Real payments before the floor still show as paid; the floor only governs
+// what counts as MISSED.
+export function dataFloor(env, dataSince = null) {
+  const stamps = [];
+  if (dataSince) {
+    const d = startOfDay(new Date(dataSince + "T00:00:00"));
+    if (!isNaN(d.getTime())) stamps.push(d.getTime());
+  }
+  const born = envelopeBorn(env);
+  if (born) stamps.push(born.getTime());
+  return stamps.length ? new Date(Math.max(...stamps)) : null;
+}
+
+// When did this envelope come into existence? Explicit `createdAt` first, then
+// a debt's `startDate`, then the creation timestamp baked into the generated id
+// (`env_1760000000000`) for envelopes that predate the field.
+function envelopeBorn(env) {
+  if (!env) return null;
+  for (const v of [env.createdAt, env.startDate]) {
+    if (!v) continue;
+    const d = startOfDay(new Date(String(v).length <= 10 ? v + "T00:00:00" : v));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const m = /^env_(\d{10,})$/.exec(env.id || "");
+  if (m) {
+    const d = startOfDay(new Date(Number(m[1])));
+    if (!isNaN(d.getTime())) return d;
+  }
+  return null;
+}
+
 export function paymentHistory(env, transactions, count = 6, dataSince = null, extraKeys = []) {
   if (!isBill(env.type)) return [];
   const today = startOfDay();
@@ -288,9 +362,10 @@ export function paymentHistory(env, transactions, count = 6, dataSince = null, e
       byPeriod.get(k).push(t);
     });
 
-  // Periods before this date are ones the app has no transaction data for —
-  // reporting them as "missed" would be a false alarm.
-  const floor = dataSince ? startOfDay(new Date(dataSince + "T00:00:00")) : null;
+  // Periods before this date are ones we can't fairly judge — either the app
+  // has no transaction data for them, or the envelope didn't exist yet.
+  // Reporting them as "missed" would be a false alarm.
+  const floor = dataFloor(env, dataSince);
 
   const buildEntry = (due, key) => {
     const hits = byPeriod.get(key) || [];
@@ -378,23 +453,32 @@ export function spentThisMonth(env, transactions) {
 // out that a wall is coming is what lets you do something about it. By the time
 // the lock lands, the money is either there or it isn't.
 
-export function lockDate(env) {
+export function lockDate(env, transactions = [], dataSince = null) {
   if (!env.autopay || !isBill(env.type)) return null;
-  const due = nextDueDate(env);
+  const due = activeDueDate(env, transactions, dataSince);
   if (!due) return null;
   return subtractBusinessDays(due, env.autopayLeadDays ?? 5);
 }
 
-export function isLocked(env, transactions) {
+export function isLocked(env, transactions, dataSince = null) {
   if (!env.autopay) return false;
-  if (isPaid(env, transactions)) return false;   // already cleared, nothing in flight
-  const lock = lockDate(env);
+  if (isPaid(env, transactions, dataSince)) return false;   // cleared, nothing in flight
+
+  // The active period can now sit in the past (an unsettled October stays
+  // October). An ACH that should have drafted a week ago and never posted is
+  // not "in flight" — it plainly didn't happen. Keeping the money hostage for a
+  // draft that isn't coming just blocks you from unfunding or paying by hand,
+  // so once the due date is past grace we let go. The overdue alert takes over.
+  const due = activeDueDate(env, transactions, dataSince);
+  if (due && daysBetween(due, startOfDay()) > GRACE_DAYS) return false;
+
+  const lock = lockDate(env, transactions, dataSince);
   if (!lock) return false;
   return startOfDay() >= lock;
 }
 
-export function daysUntilLock(env) {
-  const lock = lockDate(env);
+export function daysUntilLock(env, transactions = [], dataSince = null) {
+  const lock = lockDate(env, transactions, dataSince);
   return lock ? daysBetween(new Date(), lock) : null;
 }
 
@@ -689,9 +773,9 @@ export function safeToSpend(envelopes, checkingBalance) {
 }
 
 // How short is this envelope of what it needs?
-export function shortfall(env, transactions) {
+export function shortfall(env, transactions, dataSince = null) {
   if (!isBill(env.type)) return 0;
-  if (isPaid(env, transactions)) return 0;
+  if (isPaid(env, transactions, dataSince)) return 0;
   return Math.max(0, targetAmount(env) - (env.funded || 0));
 }
 
@@ -699,17 +783,17 @@ export function shortfall(env, transactions) {
 //
 // This is the screen that does the real work. The lock is just a guardrail —
 // this is what gives you time to act.
-export function upcomingLocks(envelopes, transactions, withinDays = 7) {
+export function upcomingLocks(envelopes, transactions, withinDays = 7, dataSince = null) {
   return envelopes
     .filter(e => e.autopay && isBill(e.type))
-    .filter(e => !isPaid(e, transactions))
-    .filter(e => !isLocked(e, transactions))
+    .filter(e => !isPaid(e, transactions, dataSince))
+    .filter(e => !isLocked(e, transactions, dataSince))
     .map(e => ({
       env: e,
-      lockIn: daysUntilLock(e),
+      lockIn: daysUntilLock(e, transactions, dataSince),
       needs: targetAmount(e),
       has: e.funded || 0,
-      short: shortfall(e, transactions),
+      short: shortfall(e, transactions, dataSince),
     }))
     .filter(x => x.lockIn !== null && x.lockIn <= withinDays)
     .sort((a, b) => a.lockIn - b.lockIn);
@@ -719,10 +803,10 @@ export function upcomingLocks(envelopes, transactions, withinDays = 7) {
 // ═════════════════════════════════════════════════════════════════════════════
 // OVERDUE — a due date came and went with nothing posted.
 //
-// This is the gap `nextDueDate` leaves: it always rolls FORWARD, so the instant
-// a due date passes the app starts counting toward next month and the missed
-// one quietly disappears. That's the single worst failure for a bill tracker —
-// silence where there should be a siren.
+// `activeDueDate` already keeps the envelope parked on the unsettled period
+// rather than rolling on to next month, so the bill doesn't vanish. This is the
+// other half: saying so out loud. A bill quietly sitting unpaid is the single
+// worst failure for a bill tracker — silence where there should be a siren.
 //
 // Grace matters here. A payment made on the due date often posts a day or two
 // later, so we don't cry wolf immediately: within the grace window it's "hasn't
@@ -756,10 +840,10 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
 
   for (const env of envelopes) {
     if (!isBill(env.type)) continue;
-    const paid = isPaid(env, transactions);
-    const locked = isLocked(env, transactions);
-    const short = shortfall(env, transactions);
-    const due = nextDueDate(env);
+    const paid = isPaid(env, transactions, dataSince);
+    const locked = isLocked(env, transactions, dataSince);
+    const short = shortfall(env, transactions, dataSince);
+    const due = activeDueDate(env, transactions, dataSince);
     const daysToDue = due ? daysBetween(new Date(), due) : null;
 
     // 🚨 A due date passed with nothing posted. This outranks everything else —
@@ -794,7 +878,7 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
     }
 
     // ⚠️ Locking soon and short — you still have time to fix it.
-    const lockIn = daysUntilLock(env);
+    const lockIn = daysUntilLock(env, transactions, dataSince);
     if (env.autopay && !paid && lockIn !== null && lockIn >= 0 && lockIn <= 4 && short > 0) {
       alerts.push({
         level: "warn",
@@ -1016,6 +1100,14 @@ export const money = n =>
     minimumFractionDigits: Number.isInteger(n) ? 0 : 2,
     maximumFractionDigits: 2,
   }).format(n || 0);
+
+// "October" / "October 2027" — the human name of a billing period. Years are
+// only worth showing once the period isn't in the current one.
+export const periodLabel = (d, { year = "auto" } = {}) => {
+  if (!d) return "";
+  const showYear = year === true || (year === "auto" && d.getFullYear() !== new Date().getFullYear());
+  return d.toLocaleDateString("en-US", showYear ? { month: "long", year: "numeric" } : { month: "long" });
+};
 
 export const shortDate = d =>
   d ? new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
