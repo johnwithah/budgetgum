@@ -611,10 +611,30 @@ export function fundingGap(env) {
   return Math.max(0, (env.monthlyBudget || 0) - (env.funded || 0));
 }
 
-export function targetAmount(env) {
+// `periodKey` is optional — most callers don't know or care which period
+// they're asking about and just want "the normal amount," which is exactly
+// what omitting it gives you (falls straight through to `billAmount`).
+//
+// Pass it when you DO know the period (you have `env` + a due-date key in
+// hand) and the bill is one where the amount legitimately changes month to
+// month — rent, electric, anything without autopay set up specifically
+// because the number isn't fixed. `env.periodAmounts[key]` is a value typed
+// in for that one period only; it never touches the envelope's own
+// `billAmount`, so correcting October doesn't quietly become the new
+// permanent estimate for every month after.
+//
+// This is deliberately a different mechanism from `autoAmount`/
+// `billAmountStats` — that one re-learns `billAmount` itself from CLEARED
+// payments, after the fact. A period override is for BEFORE the money moves:
+// you got the bill, you know the number, you want Safe to Spend and the
+// funding target to reflect it right now.
+export function targetAmount(env, periodKey = null) {
   switch (env.type) {
     case TYPES.SPENDING:  return env.monthlyBudget || 0;
-    case TYPES.RECURRING: return env.billAmount || 0;
+    case TYPES.RECURRING: {
+      const override = periodKey && env.periodAmounts ? env.periodAmounts[periodKey] : null;
+      return override != null ? override : (env.billAmount || 0);
+    }
     case TYPES.DEBT:      return suggestedPayment(env);
     case TYPES.GOAL:      return suggestedPayment(env);
     default: return 0;
@@ -776,7 +796,8 @@ export function safeToSpend(envelopes, checkingBalance) {
 export function shortfall(env, transactions, dataSince = null) {
   if (!isBill(env.type)) return 0;
   if (isPaid(env, transactions, dataSince)) return 0;
-  return Math.max(0, targetAmount(env) - (env.funded || 0));
+  const key = periodKey(env, transactions, dataSince);
+  return Math.max(0, targetAmount(env, key) - (env.funded || 0));
 }
 
 // ── The forecast: what's about to lock, and can you cover it? ────────────────
@@ -791,7 +812,7 @@ export function upcomingLocks(envelopes, transactions, withinDays = 7, dataSince
     .map(e => ({
       env: e,
       lockIn: daysUntilLock(e, transactions, dataSince),
-      needs: targetAmount(e),
+      needs: targetAmount(e, periodKey(e, transactions, dataSince)),
       has: e.funded || 0,
       short: shortfall(e, transactions, dataSince),
     }))
@@ -845,6 +866,7 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
     const short = shortfall(env, transactions, dataSince);
     const due = activeDueDate(env, transactions, dataSince);
     const daysToDue = due ? daysBetween(new Date(), due) : null;
+    const activeKey = periodKey(env, transactions, dataSince);
 
     // 🚨 A due date passed with nothing posted. This outranks everything else —
     // it's the one thing you'd never find out about on your own, because the
@@ -860,7 +882,7 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
           : `${env.name} — ${p.label} payment never posted`,
         body: overdue.pending
           ? `Due ${p.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})}. Give it a day or two, then check with the biller.`
-          : `${money(targetAmount(env))} was due ${p.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} — ${overdue.daysPast} days ago. Nothing has cleared.${overdue.count > 1 ? ` (${overdue.count} periods missed.)` : ""}`,
+          : `${money(targetAmount(env, p.key))} was due ${p.dueDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} — ${overdue.daysPast} days ago. Nothing has cleared.${overdue.count > 1 ? ` (${overdue.count} periods missed.)` : ""}`,
       });
       continue;
     }
@@ -872,7 +894,7 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
         level: "critical",
         env,
         title: `${env.name} autopay is locked and short`,
-        body: `Needs ${money(targetAmount(env))}, only ${money(env.funded || 0)} set aside. Your bank will still pull the full amount.`,
+        body: `Needs ${money(targetAmount(env, activeKey))}, only ${money(env.funded || 0)} set aside. Your bank will still pull the full amount.`,
       });
       continue;
     }
@@ -895,7 +917,7 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
         level: daysToDue <= 1 ? "warn" : "info",
         env,
         title: `${env.name} due ${daysToDue === 0 ? "today" : daysToDue === 1 ? "tomorrow" : `in ${daysToDue} days`}`,
-        body: env.paymentUrl ? "Tap to pay" : `${money(targetAmount(env))} due`,
+        body: env.paymentUrl ? "Tap to pay" : `${money(targetAmount(env, activeKey))} due`,
       });
     }
   }

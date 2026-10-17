@@ -190,7 +190,7 @@ export default function App() {
       .map(e => [
         e.id,
         e.funded || 0,
-        targetAmount(e),
+        targetAmount(e, periodKey(e, transactions, dataSince)),
         isLocked(e, transactions, dataSince) ? 1 : 0,
         isPaid(e, transactions, dataSince) ? 1 : 0,
       ].join(":"))
@@ -209,7 +209,7 @@ export default function App() {
       if (!env.autopay || !isBill(env.type)) return env;
       if (isPaid(env, transactions, dataSince)) return env;
       if (!isLocked(env, transactions, dataSince)) return env;
-      const need = targetAmount(env) - (env.funded || 0);
+      const need = targetAmount(env, periodKey(env, transactions, dataSince)) - (env.funded || 0);
       if (need <= 0.005) return env;                    // already covered
       const grab = Math.min(need, Math.max(0, available));
       if (grab <= 0.005) return env;                    // nothing spare to give
@@ -627,6 +627,23 @@ export default function App() {
       if (!cur) return e;
       return { ...e, periodNotes: { ...e.periodNotes, [key]: { ...cur, cleared: !cur.cleared } } };
     }));
+  }
+
+  // A one-period amount override — for bills like rent or electric where the
+  // number itself changes month to month, and you know THIS period's number
+  // (the bill arrived) without wanting to touch the envelope's own baseline
+  // `billAmount`, which every future period would otherwise inherit. Clearing
+  // the amount (empty/null) just removes the override and falls back to the
+  // usual billAmount — same shape as `setPeriodNote`.
+  function setPeriodAmount(env, key, amount) {
+    setEnvelopes(p => p.map(e => {
+      if (e.id !== env.id) return e;
+      const amounts = { ...(e.periodAmounts || {}) };
+      if (amount == null || isNaN(amount) || amount <= 0) delete amounts[key];
+      else amounts[key] = amount;
+      return { ...e, periodAmounts: amounts };
+    }));
+    showToast(amount ? `This period set to ${money(amount)}` : "Back to the usual amount");
   }
 
   async function handleLinked() { setBankConnected(true); showToast("Bank connected"); await syncBank(); }
@@ -1102,6 +1119,7 @@ export default function App() {
                       onUnmarkPeriod={unmarkPaid}
                       onSetPeriodNote={setPeriodNote}
                       onTogglePeriodNoteCleared={togglePeriodNoteCleared}
+                      onSetPeriodAmount={setPeriodAmount}
                       onUpdateAmount={updateBillAmount}
                       onToggleAutoAmount={toggleAutoAmount} />}
       {fundEnv   && <FundSheet env={envelopes.find(e=>e.id===fundEnv.id)} sts={sts} transactions={transactions} dataSince={dataSince}
@@ -2171,6 +2189,7 @@ function EnvRow({ env, transactions, dataSince, onOpen, onFund }) {
   const paid = isPaid(env, transactions, dataSince);
   const short = shortfall(env, transactions, dataSince);
   const due = activeDueDate(env, transactions, dataSince);
+  const key = periodKey(env, transactions, dataSince);
   const overdue = isBill(env.type) && due && daysBetween(new Date(), due) < 0;
   return (
     <div className="card" style={{padding:16}}>
@@ -2195,13 +2214,13 @@ function EnvRow({ env, transactions, dataSince, onOpen, onFund }) {
         <div style={{marginTop:12,paddingTop:12,borderTop:".5px solid rgba(255,255,255,.07)"}}>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:6}}>
             <span style={{color:"#8e8e93"}}>
-              Funded {money(env.funded||0)} / {money(targetAmount(env))}
+              Funded {money(env.funded||0)} / {money(targetAmount(env, key))}
               {due && ` for ${periodLabel(due)}`}
             </span>
             {short>0 && <span style={{color:"#ffd60a",fontWeight:600}}>{money(short)} short</span>}
           </div>
           <div className="bar" style={{marginBottom:10}}>
-            <div className="fill" style={{width:`${Math.min(100,((env.funded||0)/(targetAmount(env)||1))*100)}%`,background:short>0?"#ffd60a":"#30d158"}}/>
+            <div className="fill" style={{width:`${Math.min(100,((env.funded||0)/(targetAmount(env, key)||1))*100)}%`,background:short>0?"#ffd60a":"#30d158"}}/>
           </div>
           <button className="btn-dim" style={{padding:10,fontSize:14}} onClick={onFund} disabled={locked}>
             {locked ? "🔒 Locked" : "Fund"}
@@ -2246,7 +2265,7 @@ function BillsView({ bills, transactions, dataSince, onOpen, onMarkPaid }) {
     groups[seen.get(label)].items.push(item);
   }
 
-  const totalDue = allUnpaid.reduce((s,x) => s + Math.max(0, targetAmount(x.env) - (x.env.funded||0)), 0);
+  const totalDue = allUnpaid.reduce((s,x) => s + Math.max(0, targetAmount(x.env, periodKey(x.env, transactions, dataSince)) - (x.env.funded||0)), 0);
 
   return (
     <>
@@ -2347,7 +2366,7 @@ function PaidBillRow({ env, transactions, dataSince, onOpen }) {
           </div>
         </div>
         <div style={{textAlign:"right"}}>
-          <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>{money(manual ? targetAmount(env) : actual)}</div>
+          <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>{money(manual ? targetAmount(env, key) : actual)}</div>
           <div style={{fontSize:10.5,color:"#8e8e93"}}>{manual ? "confirmed" : "cleared"}</div>
         </div>
       </div>
@@ -2370,10 +2389,11 @@ function BillRow({ env, transactions, dataSince, onOpen, onMarkPaid }) {
   const locked = isLocked(env, transactions, dataSince);
   const due = activeDueDate(env, transactions, dataSince);
   const days = due ? daysBetween(new Date(), due) : null;
-  const amt = targetAmount(env);
+  const key = periodKey(env, transactions, dataSince);
+  const amt = targetAmount(env, key);
   const actual = paidThisPeriod(env, transactions, dataSince);
   const overdue = paid ? null : overdueInfo(env, transactions, dataSince);
-  const periodNote = env.periodNotes?.[periodKey(env, transactions, dataSince)];
+  const periodNote = env.periodNotes?.[key];
   const urg = overdue ? "#ff375f" : days===null?"#8e8e93":days<=1?"#ff375f":days<=5?"#ffd60a":"#30d158";
   return (
     <div className="card" style={{padding:"13px 15px",opacity:paid?.55:1,
@@ -2793,10 +2813,12 @@ function EnvelopeForm({ initial, onSave, onCancel }) {
   );
 }
 
-function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod, onSetPeriodNote, onTogglePeriodNoteCleared, onUpdateAmount, onToggleAutoAmount }) {
+function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelete, onFund, onMarkPaid, onMarkPeriodPaid, onUnmarkPeriod, onSetPeriodNote, onTogglePeriodNoteCleared, onSetPeriodAmount, onUpdateAmount, onToggleAutoAmount }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const [editingNoteKey, setEditingNoteKey] = useState(null);
   const [noteDraft, setNoteDraft] = useState("");
+  const [editingAmount, setEditingAmount] = useState(false);
+  const [amountDraft, setAmountDraft] = useState("");
   const locked = isLocked(env, transactions, dataSince);
   const paid = isPaid(env, transactions, dataSince);
   const risk = promoRisk(env);
@@ -2804,6 +2826,8 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
   // The period this envelope is actually working on — an unsettled October
   // stays October until it clears or you mark it paid.
   const due = activeDueDate(env, transactions, dataSince);
+  const periodKeyStr = periodKey(env, transactions, dataSince);
+  const amountOverride = env.periodAmounts?.[periodKeyStr];
   const overdue = isBill(env.type) && due && !paid && daysBetween(new Date(), due) < 0;
   const lock = lockDate(env, transactions, dataSince);
   // Unresolved notes must stay visible even if their period has aged past the
@@ -2927,12 +2951,58 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
             <DRow k={overdue ? "Was due" : "Next due"}
                   v={due ? due.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"}) : "—"}
                   danger={overdue} />
-            <DRow k={hasTarget(env.type)?"Suggested payment":"Amount"} v={money(targetAmount(env))} accent />
+            <DRow k={hasTarget(env.type)?"Suggested payment":amountOverride!=null?`Amount — ${periodLabel(due)}`:"Amount"}
+                  v={money(targetAmount(env, periodKeyStr))} accent />
             {env.minimumPayment>0 && <DRow k="Minimum payment" v={money(env.minimumPayment)} />}
             <DRow k={due ? `Set aside for ${periodLabel(due)}` : "Set aside"} v={money(env.funded||0)} />
             {env.autopay && lock && <DRow k="Locks on" v={lock.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})} />}
             {paid && <DRow k="Paid this period" v={money(paidThisPeriod(env, transactions, dataSince))} accent />}
           </>
+        )}
+
+        {/* A one-off amount for THIS period only — rent, electric, anything
+            where the number itself moves and you know it before any payment
+            clears. Doesn't touch the envelope's own billAmount, so correcting
+            October never becomes the new guess for every month after. */}
+        {env.type === TYPES.RECURRING && !paid && due && (
+          <div style={{padding:"12px 15px",borderTop:".5px solid rgba(255,255,255,.07)"}}>
+            {editingAmount ? (
+              <div style={{display:"flex",gap:6}}>
+                <input className="in" type="number" autoFocus value={amountDraft}
+                  onChange={e=>setAmountDraft(e.target.value)}
+                  placeholder={String(env.billAmount || 0)}
+                  style={{flex:1,fontSize:14,padding:"8px 10px"}} />
+                <button className="btn-mini" style={{flex:"none",padding:"8px 13px",fontSize:12.5}}
+                  onClick={()=>{ onSetPeriodAmount(env, periodKeyStr, parseFloat(amountDraft) || 0); setEditingAmount(false); }}>
+                  Save
+                </button>
+                <button className="btn-mini" style={{flex:"none",padding:"8px 13px",fontSize:12.5,color:"#8e8e93"}}
+                  onClick={()=>setEditingAmount(false)}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:12.5,color:"#8e8e93"}}>
+                  {amountOverride != null
+                    ? `Custom for ${periodLabel(due)} · usually ${money(env.billAmount || 0)}`
+                    : `Different amount this time?`}
+                </span>
+                <div style={{display:"flex",gap:12}}>
+                  {amountOverride != null && (
+                    <button className="link" style={{fontSize:12.5,color:"#8e8e93"}}
+                      onClick={()=>onSetPeriodAmount(env, periodKeyStr, null)}>
+                      Reset
+                    </button>
+                  )}
+                  <button className="link" style={{fontSize:12.5}}
+                    onClick={()=>{ setAmountDraft(String(amountOverride ?? env.billAmount ?? "")); setEditingAmount(true); }}>
+                    {amountOverride != null ? "Edit" : `Set ${periodLabel(due)}'s amount`}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
         {env.type === TYPES.SPENDING && (() => {
           const spent = spentThisMonth(env, transactions);
@@ -3111,6 +3181,7 @@ function FundSheet({ env, sts, transactions, dataSince, onFund, onUnfund, onClos
   if (!env) return null;
   const need = shortfall(env, transactions, dataSince);
   const period = activeDueDate(env, transactions, dataSince);
+  const periodKeyStr = periodKey(env, transactions, dataSince);
   const n = parseFloat(amt) || 0;
   return (
     <Sheet onClose={onClose} title={`Fund ${env.name}`}>
@@ -3126,7 +3197,7 @@ function FundSheet({ env, sts, transactions, dataSince, onFund, onUnfund, onClos
       </div>
       {need > 0 && (
         <div style={{background:"#2a2408",border:"1px solid #ffd60a33",borderRadius:11,padding:"10px 13px",marginBottom:14,fontSize:12.5,color:"#ffd60a",lineHeight:1.45}}>
-          Needs {money(need)} more to cover {money(targetAmount(env))}{period ? ` for ${periodLabel(period)}` : ""}.
+          Needs {money(need)} more to cover {money(targetAmount(env, periodKeyStr))}{period ? ` for ${periodLabel(period)}` : ""}.
         </div>
       )}
       <Label>Amount</Label>
