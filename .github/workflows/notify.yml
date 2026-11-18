@@ -1,0 +1,28 @@
+# Wakes Budgetgum's notification check (budgetgum/api/notify.js) every two
+# hours. The endpoint itself enforces quiet hours (9pm–8am in your time zone)
+# and never sends the same notification twice, so running often is harmless.
+#
+# Needs two repository secrets (GitHub → Settings → Secrets and variables → Actions):
+#   NOTIFY_URL   e.g. https://your-app.vercel.app/api/notify
+#   CRON_SECRET  the same value as the CRON_SECRET env var in Vercel
+#
+# GitHub may start scheduled runs some minutes late; that's fine here.
+name: Budgetgum notifications
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:   # "Run workflow" button, for testing
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Run notification check
+        env:
+          NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 60 \
+            -H "Authorization: Bearer $CRON_SECRET" "$NOTIFY_URL"

@@ -28,6 +28,8 @@ There is no test suite, linter config beyond CRA's default `eslintConfig: { exte
 - `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV` (`sandbox` | `development` | `production`)
 - `APP_PASSWORD_HASH` — bcrypt hash of the app password (the plaintext password is never stored)
 - `SESSION_SECRET` — HMAC key for signing session cookies
+- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` — Web Push signing keys (`npx web-push generate-vapid-keys`)
+- `CRON_SECRET` — bearer token `/api/notify` requires; also a GitHub Actions secret alongside `NOTIFY_URL`
 - Vercel KV / Upstash Redis credentials, auto-injected when a KV store is attached to the project (`@vercel/kv` reads them implicitly)
 
 ## Deploy workflow
@@ -127,6 +129,15 @@ Budget state lives on the server (Redis via `/api/state`), not primarily in the 
 - The Plaid `access_token` is **never sent to the browser**, ever — it's written straight to Redis in `exchange_public_token.js` and read server-side only in `get_transactions.js`. This was a deliberate fix from an earlier version that stored it in `localStorage`.
 - Login has a crude in-memory (per-warm-instance, not durable) rate limiter — acknowledged in comments as not airtight against serverless cold starts, but enough to slow a naive brute force.
 - Frontend auto-lock: idle timeout (`autoLockMinutes`, default 10, 0 = never) calls the real `/api/logout` (destroys the session), not just a UI cover screen. Activity tracking deliberately excludes `mousemove` (a nudged desk/cat shouldn't keep the app unlocked).
+
+## Push notifications and Face ID (PWA)
+
+- **Service worker** `public/sw.js` (registered in `src/index.js`, production only): shows pushes, routes notification taps (`/?open=<envId>` opens that envelope, `/?sync=1` runs a bank sync, both handled in App.js once `stateReady`), and caches the app shell. Never caches `/api/*`.
+- **Subscriptions** live in Redis `push:subscriptions` (via `/api/push`), deliberately *not* in `app:state` — that blob is last-write-wins from the browser and a stale tab would unsubscribe devices. **Preferences** (`state.notifications`) do live in app state; defaults are duplicated in `EMPTY_STATE` and `DEFAULT_PREFS` in `api/_notifications.js` — keep in sync.
+- **The check** `/api/notify` is triggered by `.github/workflows/notify.yml` every 2h (not a Vercel cron — that would need `vercel.json`). It reads app state, pulls 14 days of Plaid transactions *read-only* (never writes state), and runs `api/_notifications.js`, which imports the real `src/engine.js` so notifications always match the UI. It mirrors `applyPayments` for unsynced payments so a bill paid this morning doesn't get a "due tomorrow" ping. Dedupe keys go in `push:sent`; quiet hours 9pm–8am in the subscribing device's time zone; max 5 per run. `?dry=1` reports without sending.
+- **Passkeys** (`/api/passkey`, `@simplewebauthn/server`): registration requires an existing password session; login-verify issues the same session cookie as `/api/login`. Credentials are bound to the domain they were created on (rpID derived from the request host), so a passkey made on a preview URL won't work on production.
+- **Function budget**: Vercel Hobby allows 12 functions per deployment; there are 11 non-underscore files in `api/`. Add actions to an existing route before adding a new file.
+- `@simplewebauthn/server` needs Node ≥ 22 on Vercel.
 
 ## Known gaps / deliberate non-features (don't "fix" these without understanding why)
 

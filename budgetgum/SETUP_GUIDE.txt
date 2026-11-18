@@ -63,6 +63,33 @@ SWITCHING TO LIVE DATA (after Plaid approves)
 5. Save → Vercel redeploys automatically
 
 
+NOTIFICATIONS + FACE ID (one-time setup)
+──────────────────────────────────────────
+1. On your computer, in the budgetgum folder, run:
+     npx web-push generate-vapid-keys
+   It prints a Public Key and a Private Key.
+2. Vercel → budgetgum project → Settings → Environment Variables, add:
+     VAPID_PUBLIC_KEY   →  the Public Key
+     VAPID_PRIVATE_KEY  →  the Private Key
+     VAPID_SUBJECT      →  mailto:you@example.com  (any email you own)
+     CRON_SECRET        →  a long random string (e.g. run: openssl rand -hex 32)
+   Then redeploy (Deployments → ⋯ → Redeploy).
+3. GitHub → budgetgum repo → Settings → Secrets and variables → Actions,
+   add two repository secrets:
+     NOTIFY_URL   →  https://YOUR-APP.vercel.app/api/notify
+     CRON_SECRET  →  the same value you gave Vercel
+   The "Budgetgum notifications" workflow then runs every 2 hours.
+   (Actions tab → Budgetgum notifications → Run workflow to test it now.)
+4. On your iPhone: open Budgetgum FROM THE HOME SCREEN ICON (not Safari) →
+   Settings → Notifications → "Turn on for this device" → Allow.
+   Tap "Send test" to confirm.
+5. Same Settings sheet → Face ID unlock → "Set up Face ID".
+   Repeat on each device you use. Your password keeps working as a backup.
+
+Check what the next run would send, without sending anything:
+  curl -H "Authorization: Bearer YOUR_CRON_SECRET" "https://YOUR-APP.vercel.app/api/notify?dry=1"
+
+
 TIPS
 ────
 Sync transactions:  Activity tab → "↻ Sync Bank"

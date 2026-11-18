@@ -4,17 +4,25 @@
 // The frontend calls this on load to decide whether to show the lock screen or
 // the app. Note what it does NOT return: the Plaid access token. The browser has
 // no business knowing it. It only learns the boolean "a bank is connected."
+//
+// `passkey` (whether Face ID unlock is set up) is answered even when signed
+// out — the lock screen needs it to decide whether to offer the Face ID button.
+// It's a yes/no about this one-person app, not anything worth hiding.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { kv } = require('@vercel/kv');
 const { isAuthenticated, handlePreflight } = require('./_auth');
-const { ACCESS_TOKEN_KEY } = require('./_kv');
+const { ACCESS_TOKEN_KEY, PASSKEYS_KEY } = require('./_kv');
+
+async function hasPasskey() {
+  try { return ((await kv.get(PASSKEYS_KEY)) || []).length > 0; } catch { return false; }
+}
 
 module.exports = async (req, res) => {
   if (handlePreflight(req, res)) return;
 
   if (!isAuthenticated(req)) {
-    return res.status(200).json({ authenticated: false, bankConnected: false });
+    return res.status(200).json({ authenticated: false, bankConnected: false, passkey: await hasPasskey() });
   }
 
   let bankConnected = false;
@@ -26,5 +34,5 @@ module.exports = async (req, res) => {
     // Fail closed on the bank flag — if we can't reach KV, don't claim connected.
   }
 
-  res.status(200).json({ authenticated: true, bankConnected });
+  res.status(200).json({ authenticated: true, bankConnected, passkey: await hasPasskey() });
 };

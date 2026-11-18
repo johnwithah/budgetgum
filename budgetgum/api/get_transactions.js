@@ -11,20 +11,10 @@
 // it can't be used to reach any data the session doesn't already own.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
 const { kv } = require('@vercel/kv');
 const { requireAuth, handlePreflight } = require('./_auth');
 const { ACCESS_TOKEN_KEY, ACCOUNTS_KEY } = require('./_kv');
-
-const plaidClient = new PlaidApi(new Configuration({
-  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
-  baseOptions: {
-    headers: {
-      'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
-      'PLAID-SECRET': process.env.PLAID_SECRET,
-    },
-  },
-}));
+const { plaidClient, mapTransaction, mapAccount } = require('./_plaid');
 
 // Accept only a clean YYYY-MM-DD string. Anything else → ignore it and fall back.
 function cleanDate(s) {
@@ -86,34 +76,9 @@ module.exports = async (req, res) => {
     // anything before the cutoff so nothing sneaks in behind your envelopes.
     const transactions = txRes.data.transactions
       .filter(t => t.date >= startStr)
-      .map(t => ({
-        id: t.transaction_id,
-        desc: t.merchant_name || t.name,
-        // Preserve Plaid's sign convention: POSITIVE = money leaving (a debit/
-        // purchase), NEGATIVE = money coming in (a deposit/credit). The app keys
-        // off this: amount > 0 acts on envelopes, amount <= 0 is an inflow that's
-        // only recorded. Don't Math.abs() this — it destroys the distinction.
-        amount: t.amount,
-        date: t.date,
-        category: t.personal_finance_category?.primary || t.category?.[0] || 'Other',
-        // Merchant branding, when Plaid has enriched this transaction. Not
-        // always present — depends on the merchant and your Plaid plan — so the
-        // app treats it as a bonus, never a requirement.
-        logo: t.logo_url || null,
-        website: t.website || null,
-        pending: t.pending,
-        type: 'bank',
-      }));
+      .map(mapTransaction);
 
-    const accounts = balRes.data.accounts.map(a => ({
-      id: a.account_id,
-      name: a.name,
-      type: a.type,
-      subtype: a.subtype,
-      balance: a.balances.current,
-      available: a.balances.available,
-      mask: a.mask,
-    }));
+    const accounts = balRes.data.accounts.map(mapAccount);
 
     try { await kv.set(ACCOUNTS_KEY, accounts); } catch {}
 

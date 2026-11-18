@@ -15,8 +15,7 @@
 
 const { kv } = require('@vercel/kv');
 const { requireAuth, handlePreflight } = require('./_auth');
-
-const STATE_KEY = 'app:state';
+const { STATE_KEY } = require('./_kv');
 
 // Guard against a runaway payload wedging the store.
 const MAX_BYTES = 1_500_000; // ~1.5 MB
@@ -30,6 +29,9 @@ const EMPTY = {
   lastSync: null,
   importSince: '2026-07-14',
   autoLockMinutes: 10,
+  // Push notification preferences. Defaults live in _notifications.js and
+  // EMPTY_STATE in src/useCloudState.js; null means "use the defaults."
+  notifications: null,
   updatedAt: null,
 };
 
@@ -67,6 +69,8 @@ module.exports = async (req, res) => {
       lastSync:     body.lastSync     || null,
       importSince:  body.importSince  || '2026-07-14',
       autoLockMinutes: typeof body.autoLockMinutes === 'number' ? body.autoLockMinutes : 10,
+      notifications: body.notifications && typeof body.notifications === 'object' && !Array.isArray(body.notifications)
+        ? body.notifications : null,
       updatedAt:    Date.now(),
     };
 

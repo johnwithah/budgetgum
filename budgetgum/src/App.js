@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { usePlaidLink } from "react-plaid-link";
+import { startRegistration, startAuthentication, browserSupportsWebAuthn } from "@simplewebauthn/browser";
 import { useCloudState, EMPTY_STATE, clearCache } from "./useCloudState";
 import {
   TYPES, TYPE_META, isBill, hasTarget,
@@ -26,8 +27,29 @@ const ICONS  = ["💳","🏦","🏠","⚡","🚗","🛒","🍕","🎬","💊","�
 const COLORS = ["#30d158","#0a84ff","#ffd60a","#bf5af2","#ff375f","#ff9f0a","#64d2ff","#5e5ce6","#ff6961","#34c759"];
 
 // ═════════════════════════════════════════════════════════════════════════════
-function LockScreen({ onUnlock }) {
+function LockScreen({ onUnlock, passkey }) {
   const [pw, setPw] = useState(""); const [err, setErr] = useState(null); const [busy, setBusy] = useState(false);
+  const faceId = passkey && browserSupportsWebAuthn();
+
+  // Face ID / Touch ID: the server sends a one-time challenge, the device signs
+  // it after the biometric check, the server verifies and sets the session.
+  async function unlockWithPasskey() {
+    if (busy) return;
+    setBusy(true); setErr(null);
+    try {
+      const o = await api("/api/passkey", { action: "login-options" });
+      if (!o.ok) throw new Error((await o.json().catch(()=>({}))).error || "Face ID unavailable");
+      const response = await startAuthentication({ optionsJSON: await o.json() });
+      const r = await api("/api/passkey", { action: "login-verify", response });
+      if (r.ok) { onUnlock(); return; }
+      setErr((await r.json().catch(()=>({}))).error || "Face ID check failed");
+    } catch (e) {
+      // Cancelling the Face ID sheet isn't an error worth shouting about.
+      if (e?.name !== "NotAllowedError" && e?.name !== "AbortError") setErr(e.message || "Face ID failed");
+    }
+    setBusy(false);
+  }
+
   async function submit() {
     if (!pw || busy) return;
     setBusy(true); setErr(null);
@@ -44,13 +66,19 @@ function LockScreen({ onUnlock }) {
         @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}.shake{animation:shake .3s}`}</style>
       <div style={{fontSize:64,marginBottom:20}}>🍬</div>
       <div style={{fontSize:32,fontWeight:700,letterSpacing:"-1.2px",marginBottom:6}}>Budgetgum</div>
-      <div style={{fontSize:15,color:"#636366",marginBottom:36}}>Enter your password to unlock</div>
-      <input type="password" value={pw} autoFocus onChange={e=>{setPw(e.target.value);setErr(null);}}
+      <div style={{fontSize:15,color:"#636366",marginBottom:36}}>{faceId ? "Unlock with Face ID or your password" : "Enter your password to unlock"}</div>
+      {faceId && (
+        <button onClick={unlockWithPasskey} disabled={busy}
+          style={{background:"#c5f135",color:"#000",border:"none",borderRadius:14,padding:16,width:"100%",fontFamily:"inherit",fontSize:17,fontWeight:600,cursor:"pointer",marginBottom:22,opacity:busy?.4:1}}>
+          {busy ? "Unlocking…" : "Unlock with Face ID"}
+        </button>
+      )}
+      <input type="password" value={pw} autoFocus={!faceId} onChange={e=>{setPw(e.target.value);setErr(null);}}
         onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="Password" className={err?"shake":""}
         style={{background:"#1c1c1e",border:err?"1px solid #ff375f":"1px solid #2c2c2e",color:"#fff",borderRadius:14,padding:"16px 18px",width:"100%",fontFamily:"inherit",fontSize:17,outline:"none",marginBottom:12}}/>
       {err && <div style={{color:"#ff375f",fontSize:14,marginBottom:12}}>{err}</div>}
       <button onClick={submit} disabled={busy||!pw}
-        style={{background:"#c5f135",color:"#000",border:"none",borderRadius:14,padding:16,width:"100%",fontFamily:"inherit",fontSize:17,fontWeight:600,cursor:"pointer",opacity:(busy||!pw)?.4:1}}>
+        style={{background:faceId?"#2c2c2e":"#c5f135",color:faceId?"#fff":"#000",border:"none",borderRadius:14,padding:16,width:"100%",fontFamily:"inherit",fontSize:17,fontWeight:600,cursor:"pointer",opacity:(busy||!pw)?.4:1}}>
         {busy?"Unlocking…":"Unlock"}
       </button>
     </div>
@@ -91,11 +119,12 @@ function PlaidButton({ onLinked, onError, label = "🏦  Connect Your Bank" }) {
 export default function App() {
   const [authState, setAuthState] = useState("checking");
   const [bankConnected, setBankConnected] = useState(false);
+  const [hasPasskey, setHasPasskey] = useState(false);   // Face ID unlock set up
 
   // ── THE BIG CHANGE ────────────────────────────────────────────────────────
   // One state object, living on the server. Every device reads the same row.
   // localStorage is now just a cache so the app renders instantly offline.
-  const [state, setState, syncStatus, saveNow] = useCloudState(authState === "unlocked");
+  const [state, setState, syncStatus, saveNow, stateReady] = useCloudState(authState === "unlocked");
   const { envelopes, transactions, accounts, unmapped } = state;
 
   // Thin wrappers so every existing call site still reads naturally.
@@ -163,6 +192,7 @@ export default function App() {
       const d = await r.json();
       setAuthState(d.authenticated ? "unlocked" : "locked");
       setBankConnected(Boolean(d.bankConnected));
+      setHasPasskey(Boolean(d.passkey));
     } catch { setAuthState("locked"); }
   }, []);
   useEffect(() => { checkSession(); }, [checkSession]);
@@ -693,9 +723,36 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authState, lockMinutes]);
 
+  // ── NOTIFICATION DEEP LINKS ───────────────────────────────────────────────
+  // Tapping a notification opens /?open=<envelopeId> (a bill or promo alert)
+  // or /?sync=1 (new transactions to sort). If the app is already running, the
+  // service worker posts the URL here instead of reloading. Either way the link
+  // waits until you're unlocked AND the server copy of the budget has loaded —
+  // so it opens the real envelope, and a sync never lands on a stale cache.
+  const [pendingLink, setPendingLink] = useState(() => window.location.search);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = e => {
+      if (e.data?.type === "open-url") setPendingLink(new URL(e.data.url, window.location.origin).search);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
+
+  useEffect(() => {
+    if (authState !== "unlocked" || !stateReady || !pendingLink) return;
+    const p = new URLSearchParams(pendingLink);
+    setPendingLink("");
+    window.history.replaceState(null, "", window.location.pathname);
+    const env = p.get("open") && envelopes.find(e => e.id === p.get("open"));
+    if (env) { setTab(isBill(env.type) ? "bills" : "envelopes"); setDetailEnv(env); }
+    if (p.get("sync") === "1" && bankConnected) { setTab("home"); syncBank(); }
+  }, [authState, stateReady, pendingLink, envelopes, bankConnected, syncBank]);
+
   if (authState === "checking")
     return <div style={{background:"#000",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{fontSize:44,opacity:.35}}>🍬</div></div>;
-  if (authState === "locked") return <LockScreen onUnlock={checkSession} />;
+  if (authState === "locked") return <LockScreen onUnlock={checkSession} passkey={hasPasskey} />;
 
   return (
     <div style={S.app}>
@@ -1102,6 +1159,7 @@ export default function App() {
       {/* ═══ SHEETS ═══ */}
       {settings  && <SettingsSheet state={state} saveNow={saveNow} syncStatus={syncStatus}
                       bankConnected={bankConnected}
+                      hasPasskey={hasPasskey} onPasskeyChange={setHasPasskey}
                       miscategorized={miscategorizedDeposits}
                       onFixDeposits={()=>{ fixAllDeposits(); setSettings(false); }}
                       onDisconnectBank={async()=>{ await api("/api/disconnect_bank"); setBankConnected(false); setAccounts([]); showToast("Bank disconnected"); }}
@@ -1664,7 +1722,7 @@ function SyncDot({ status }) {
 // ═════════════════════════════════════════════════════════════════════════════
 // SETTINGS — backup, restore, bank, lock
 // ═════════════════════════════════════════════════════════════════════════════
-function SettingsSheet({ state, saveNow, syncStatus, bankConnected, miscategorized, onFixDeposits, onDisconnectBank, onLogout, onClose, onToast }) {
+function SettingsSheet({ state, saveNow, syncStatus, bankConnected, hasPasskey, onPasskeyChange, miscategorized, onFixDeposits, onDisconnectBank, onLogout, onClose, onToast }) {
   const [restoring, setRestoring] = useState(false);
   const [json, setJson] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
@@ -1796,6 +1854,9 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, miscategoriz
         </div>
       </div>
 
+      <FaceIdSettings hasPasskey={hasPasskey} onChange={onPasskeyChange} onToast={onToast} />
+      <NotificationSettings state={state} saveNow={saveNow} onToast={onToast} />
+
       {/* Import cutoff — only pull transactions on/after this date */}
       <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
         <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>Import transactions from</div>
@@ -1863,6 +1924,245 @@ function SettingsSheet({ state, saveNow, syncStatus, bankConnected, miscategoriz
         </button>
       )}
     </Sheet>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// A short name for this device, so Settings can say what's subscribed.
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  if (/iPhone/.test(ua)) return "iPhone";
+  if (/iPad/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) return "iPad";
+  if (/Android/.test(ua)) return "Android";
+  if (/Macintosh/.test(ua)) return "Mac";
+  if (/Windows/.test(ua)) return "Windows";
+  return "Browser";
+}
+
+function Toggle({ on, onClick }) {
+  return (
+    <button onClick={onClick} aria-pressed={on}
+      style={{width:46,height:28,borderRadius:14,border:"none",cursor:"pointer",flexShrink:0,position:"relative",
+              background:on?"#30d158":"#3a3a3c",transition:"background .15s"}}>
+      <span style={{position:"absolute",top:3,left:on?21:3,width:22,height:22,borderRadius:11,background:"#fff",transition:"left .15s"}}/>
+    </button>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Face ID / Touch ID unlock via passkeys. Adding one requires being signed in,
+// so the password stays the root of trust (and the fallback).
+function FaceIdSettings({ hasPasskey, onChange, onToast }) {
+  const [busy, setBusy] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+  if (!browserSupportsWebAuthn()) return null;
+
+  async function add() {
+    setBusy(true);
+    try {
+      const o = await api("/api/passkey", { action: "register-options" });
+      if (!o.ok) throw new Error("Couldn't start setup");
+      const response = await startRegistration({ optionsJSON: await o.json() });
+      const r = await api("/api/passkey", { action: "register-verify", response, label: deviceLabel() });
+      if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || "Setup failed");
+      onChange(true);
+      onToast("Face ID unlock is on");
+    } catch (e) {
+      if (e?.name === "InvalidStateError") onToast("This device is already set up");
+      else if (e?.name !== "NotAllowedError" && e?.name !== "AbortError") onToast(e.message || "Setup failed");
+    }
+    setBusy(false);
+  }
+
+  async function removeAll() {
+    setBusy(true);
+    const r = await api("/api/passkey", { action: "remove-all" }).catch(() => null);
+    if (r?.ok) { onChange(false); onToast("Face ID unlock turned off"); }
+    else onToast("Couldn't turn it off");
+    setConfirmOff(false);
+    setBusy(false);
+  }
+
+  return (
+    <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
+      <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>Face ID unlock</div>
+      <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+        {hasPasskey
+          ? "On. Unlock with Face ID or Touch ID; your password still works as a backup. Set up each device you use."
+          : "Unlock with Face ID or Touch ID instead of typing your password. Your password still works as a backup."}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button className="btn-dim" style={{flex:1}} disabled={busy} onClick={add}>
+          {hasPasskey ? "Add this device" : "Set up Face ID"}
+        </button>
+        {hasPasskey && (
+          <button className="btn-dim" disabled={busy}
+            style={{flex:1,...(confirmOff ? {background:"#ff375f",color:"#fff"} : {color:"#ff375f"})}}
+            onClick={confirmOff ? removeAll : ()=>setConfirmOff(true)}>
+            {confirmOff ? "Turn off everywhere?" : "Turn off"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Push notifications. Which DEVICES get them is stored server-side (/api/push);
+// WHAT you're told about lives in state.notifications so every device agrees.
+// The server checks every couple of hours, 8am–9pm your time (api/notify.js).
+function urlBase64ToBytes(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+function NotificationSettings({ state, saveNow, onToast }) {
+  const prefs = { ...EMPTY_STATE.notifications, ...(state.notifications || {}) };
+  const supported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const installed = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+  const [server, setServer] = useState(null);   // { configured, publicKey, devices }
+  const [sub, setSub] = useState(null);         // this device's PushSubscription
+  const [busy, setBusy] = useState(false);
+  const [threshold, setThreshold] = useState(String(prefs.lowThreshold));
+
+  useEffect(() => {
+    fetch("/api/push", { credentials: "same-origin" })
+      .then(r => (r.ok ? r.json() : null)).then(setServer).catch(() => setServer(null));
+    if (supported) {
+      navigator.serviceWorker.getRegistration()
+        .then(reg => reg?.pushManager.getSubscription())
+        .then(s => setSub(s || null)).catch(() => {});
+    }
+  }, [supported]);
+
+  function setPref(key, value) {
+    saveNow({ ...state, notifications: { ...prefs, [key]: value } });
+  }
+
+  async function enable() {
+    setBusy(true);
+    try {
+      // Must be the first thing after the tap — iOS only shows the permission
+      // prompt in direct response to a user gesture.
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") throw new Error("Notifications are blocked. Allow them in your device's Settings.");
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) throw new Error("App isn't fully installed yet. Reload and try again.");
+      const s = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToBytes(server.publicKey),
+      });
+      const r = await api("/api/push", {
+        action: "subscribe",
+        subscription: s.toJSON(),
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        label: deviceLabel(),
+      });
+      if (!r.ok) throw new Error("Server didn't accept the subscription");
+      const d = await r.json();
+      setSub(s);
+      setServer(v => ({ ...v, devices: d.devices }));
+      onToast("Notifications on for this device");
+    } catch (e) { onToast(e.message || "Couldn't turn on notifications"); }
+    setBusy(false);
+  }
+
+  async function disable() {
+    setBusy(true);
+    try {
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe();
+      const r = await api("/api/push", { action: "unsubscribe", endpoint });
+      const d = await r.json().catch(() => ({}));
+      setSub(null);
+      setServer(v => ({ ...v, devices: d.devices ?? Math.max(0, (v?.devices || 1) - 1) }));
+      onToast("Notifications off for this device");
+    } catch { onToast("Couldn't turn off notifications"); }
+    setBusy(false);
+  }
+
+  async function test() {
+    setBusy(true);
+    const r = await api("/api/push", { action: "test" }).catch(() => null);
+    const d = r ? await r.json().catch(() => ({})) : {};
+    onToast(r?.ok ? `Test sent to ${d.sent} device${d.sent === 1 ? "" : "s"}` : "Test failed");
+    setBusy(false);
+  }
+
+  const note = (text) => <div style={{fontSize:12,color:"#ff9f0a",lineHeight:1.5,marginBottom:10}}>{text}</div>;
+  const prefRow = (label, sub, key) => (
+    <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderTop:".5px solid rgba(255,255,255,.08)"}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:14}}>{label}</div>
+        {sub && <div style={{fontSize:11.5,color:"#8e8e93",marginTop:2,lineHeight:1.4}}>{sub}</div>}
+      </div>
+      <Toggle on={!!prefs[key]} onClick={()=>setPref(key, !prefs[key])} />
+    </div>
+  );
+
+  return (
+    <div className="grp" style={{marginBottom:8,padding:"13px 15px"}}>
+      <div style={{fontSize:14.5,fontWeight:600,marginBottom:3}}>Notifications</div>
+      <div style={{fontSize:12,color:"#8e8e93",lineHeight:1.5,marginBottom:10}}>
+        Checked every couple of hours between 8am and 9pm, even when the app is closed.
+      </div>
+
+      {server && !server.configured ? note("Not set up on the server yet. Add the VAPID keys to Vercel (see SETUP_GUIDE.txt).")
+        : isIOS && !installed ? note("On iPhone, notifications only work from the Home Screen app. Tap Share → Add to Home Screen, then open Budgetgum from there.")
+        : !supported ? note("This browser doesn't support push notifications.")
+        : server && (
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            {sub ? (
+              <>
+                <button className="btn-dim" style={{flex:1}} disabled={busy} onClick={test}>Send test</button>
+                <button className="btn-dim" style={{flex:1,color:"#ff375f"}} disabled={busy} onClick={disable}>Turn off here</button>
+              </>
+            ) : (
+              <button className="btn-green" style={{flex:1,fontSize:14,padding:13}} disabled={busy} onClick={enable}>
+                Turn on for this device
+              </button>
+            )}
+          </div>
+        )}
+
+      {prefRow("Bills coming due", "Due-date reminders, autopay locks, and anything overdue", "bills")}
+      {prefs.bills && (
+        <div style={{display:"flex",alignItems:"center",gap:6,padding:"0 0 10px"}}>
+          <span style={{fontSize:12,color:"#8e8e93",flex:1}}>First reminder</span>
+          {[1,3,5,7].map(d=>{
+            const on = prefs.billLeadDays === d;
+            return (
+              <button key={d} onClick={()=>setPref("billLeadDays", d)}
+                style={{background:on?"#c5f135":"#2c2c2e",color:on?"#000":"#fff",border:"none",borderRadius:9,
+                        padding:"7px 10px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                {d}d
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {prefRow("New transactions to sort", null, "sort")}
+      {prefRow("Low Safe to Spend", null, "lowBalance")}
+      {prefs.lowBalance && (
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"0 0 10px"}}>
+          <span style={{fontSize:12,color:"#8e8e93",flex:1}}>Alert below</span>
+          <input className="in" type="number" inputMode="decimal" min="0" value={threshold}
+            onChange={e=>setThreshold(e.target.value)}
+            onBlur={()=>{ const v = Math.max(0, Number(threshold) || 0); setThreshold(String(v)); if (v !== prefs.lowThreshold) setPref("lowThreshold", v); }}
+            style={{width:110,padding:"8px 12px",fontSize:14}} />
+        </div>
+      )}
+      {prefRow("0% promo ending", "Debt envelopes with a promo end date", "promo")}
+
+      {server?.configured && (
+        <div style={{fontSize:11.5,color:"#636366",marginTop:6}}>
+          {server.devices} device{server.devices === 1 ? "" : "s"} receiving notifications
+        </div>
+      )}
+    </div>
   );
 }
 

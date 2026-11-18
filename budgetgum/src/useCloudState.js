@@ -43,6 +43,14 @@ export const EMPTY_STATE = {
   lastSync: null,
   importSince: "2026-07-14",   // only import bank transactions on/after this date
   autoLockMinutes: 10,         // sign out after this many minutes idle (0 = never)
+  // Push notification preferences — keep in sync with DEFAULT_PREFS in
+  // api/_notifications.js. Which devices receive them is stored server-side.
+  notifications: {
+    bills: true, billLeadDays: 3,
+    sort: true,
+    lowBalance: true, lowThreshold: 100,
+    promo: true,
+  },
 };
 
 function readCache() {
@@ -86,6 +94,7 @@ export function clearCache() {
 export function useCloudState(enabled) {
   const [state, setStateRaw] = useState(readCache);
   const [status, setStatus] = useState("idle"); // idle | loading | saving | saved | error
+  const [ready, setReady] = useState(false);    // server copy has loaded (or we gave up)
 
   const timer = useRef(null);
   const pending = useRef(null);
@@ -144,6 +153,7 @@ export function useCloudState(enabled) {
         // Offline or server down — keep running on the cache. Not fatal.
         setStatus("error");
       }
+      setReady(true);
     })();
   }, [enabled, push]);
 
@@ -196,5 +206,5 @@ export function useCloudState(enabled) {
     await push(next);
   }, [push]);
 
-  return [state, setState, status, saveNow];
+  return [state, setState, status, saveNow, ready];
 }
