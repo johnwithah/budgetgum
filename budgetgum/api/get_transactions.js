@@ -7,14 +7,22 @@
 // NEW: the client may pass a `since` date (YYYY-MM-DD). We won't fetch anything
 // before it. This lets the app say "only import transactions from July 14 on,"
 // which keeps old history from backfilling into envelopes you just created.
-// `since` is the only thing we read from the body, and it's validated hard —
-// it can't be used to reach any data the session doesn't already own.
+// `since` is validated hard — it can't be used to reach any data the session
+// doesn't already own.
+//
+// `refresh: true` additionally asks Plaid to re-check the bank right now (see
+// requestRefresh in _plaid.js). This response still carries what Plaid already
+// had; anything the refresh turns up arrives a minute or so later, so the app
+// syncs again quietly when `refresh.status` comes back "requested".
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { kv } = require('@vercel/kv');
 const { requireAuth, handlePreflight } = require('./_auth');
 const { ACCESS_TOKEN_KEY, ACCOUNTS_KEY } = require('./_kv');
-const { plaidClient, mapTransaction, mapAccount } = require('./_plaid');
+const { plaidClient, mapTransaction, mapAccount, fetchAllTransactions, requestRefresh } = require('./_plaid');
+
+// The Sync button can trigger a bank refresh at most this often.
+const REFRESH_MIN_MINUTES = 15;
 
 // Accept only a clean YYYY-MM-DD string. Anything else → ignore it and fall back.
 function cleanDate(s) {
@@ -62,19 +70,15 @@ module.exports = async (req, res) => {
   const endStr = today.toISOString().split('T')[0];
 
   try {
-    const [txRes, balRes] = await Promise.all([
-      plaidClient.transactionsGet({
-        access_token: accessToken,
-        start_date: startStr,
-        end_date: endStr,
-        options: { count: 100 },
-      }),
+    const [txRes, balRes, refresh] = await Promise.all([
+      fetchAllTransactions(accessToken, startStr, endStr),
       plaidClient.accountsBalanceGet({ access_token: accessToken }),
+      req.body?.refresh === true ? requestRefresh(accessToken, REFRESH_MIN_MINUTES) : null,
     ]);
 
     // Backstop filter: even if Plaid returns an edge-case earlier date, drop
     // anything before the cutoff so nothing sneaks in behind your envelopes.
-    const transactions = txRes.data.transactions
+    const transactions = txRes.transactions
       .filter(t => t.date >= startStr)
       .map(mapTransaction);
 
@@ -82,7 +86,7 @@ module.exports = async (req, res) => {
 
     try { await kv.set(ACCOUNTS_KEY, accounts); } catch {}
 
-    res.status(200).json({ transactions, accounts, since: startStr });
+    res.status(200).json({ transactions, accounts, since: startStr, refresh });
   } catch (err) {
     const detail = err.response?.data || { message: err.message };
     console.error('get_transactions error:', JSON.stringify(detail));

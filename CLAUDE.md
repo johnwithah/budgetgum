@@ -138,6 +138,8 @@ Budget state lives on the server (Redis via `/api/state`), not primarily in the 
 - **Passkeys** (`/api/passkey`, `@simplewebauthn/server`): registration requires an existing password session; login-verify issues the same session cookie as `/api/login`. Credentials are bound to the domain they were created on (rpID derived from the request host), so a passkey made on a preview URL won't work on production.
 - **Function budget**: Vercel Hobby allows 12 functions per deployment; there are 11 non-underscore files in `api/`. Add actions to an existing route before adding a new file.
 - `@simplewebauthn/server` needs Node ≥ 22 on Vercel.
+- `web-push` is pinned to 3.6.7: 4.x is ESM-only and crashes on load under the CJS `api/` files on Vercel.
+- **Bank freshness**: Plaid only pulls from the bank a few times a day, so "my bank shows it but Budgetgum doesn't" is usually Plaid lag, not an app bug. `GET /api/notify?dry=1` returns a `sync` block (Plaid's last refresh time, transactions Plaid has that the app doesn't). `requestRefresh()` in `api/_plaid.js` calls `/transactions/refresh` — from Sync (≤ once per 15 min, followed by quiet re-syncs at 1 and 3 min) and from the scheduled check (≤ once per 6h); if Plaid refuses (add-on not enabled) it backs off for 24h. `fetchAllTransactions()` pages through `transactionsGet` (the old single call capped at 100).
 
 ## Known gaps / deliberate non-features (don't "fix" these without understanding why)
 

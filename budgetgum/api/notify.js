@@ -21,8 +21,8 @@
 
 const crypto = require('crypto');
 const { kv } = require('@vercel/kv');
-const { STATE_KEY, ACCESS_TOKEN_KEY, PUSH_SENT_KEY } = require('./_kv');
-const { plaidClient, mapTransaction, mapAccount } = require('./_plaid');
+const { STATE_KEY, ACCESS_TOKEN_KEY, PUSH_SENT_KEY, REFRESH_KEY } = require('./_kv');
+const { plaidClient, mapTransaction, mapAccount, fetchAllTransactions, requestRefresh } = require('./_plaid');
 const { pushConfigured, getSubscriptions, sendToAll } = require('./_push');
 const { computeNotifications } = require('./_notifications');
 
@@ -30,6 +30,10 @@ const QUIET_START = 21;   // 9pm
 const QUIET_END = 8;      // 8am
 const MAX_PER_RUN = 5;    // a backlog arrives as a handful, not a flood
 const KEEP_SENT_DAYS = 120;
+// Ask Plaid to re-check the bank at most this often from the scheduled check,
+// so "new transactions to sort" isn't stuck on Plaid's own (slower) schedule.
+// What the refresh finds is picked up by the next run, two hours later.
+const REFRESH_MIN_MINUTES = 6 * 60;
 
 function authorized(req) {
   const secret = process.env.CRON_SECRET;
@@ -53,13 +57,11 @@ async function fetchFromBank(accessToken, importSince) {
 
   // transactionsGet returns account balances too, so no separate Balance call
   // (which Plaid bills per request) is needed.
-  const r = await plaidClient.transactionsGet({
-    access_token: accessToken, start_date: start, end_date: end, options: { count: 250 },
-  });
+  const r = await fetchAllTransactions(accessToken, start, end);
   return {
-    fresh: r.data.transactions.filter(t => t.date >= start).map(mapTransaction),
-    accounts: r.data.accounts.map(mapAccount),
-    total: r.data.total_transactions,
+    fresh: r.transactions.filter(t => t.date >= start).map(mapTransaction),
+    accounts: r.accounts.map(mapAccount),
+    total: r.total,
   };
 }
 
@@ -68,6 +70,7 @@ async function fetchFromBank(accessToken, importSince) {
 // that the app doesn't — with the reason a Sync would skip it, if any.
 async function syncHealth(accessToken, state, bank) {
   const health = { appLastSync: state.lastSync || null, importSince: state.importSince || null };
+  health.lastRefreshRequest = await kv.get(REFRESH_KEY).catch(() => null);
   try {
     const item = await plaidClient.itemGet({ access_token: accessToken });
     const t = item.data.status?.transactions || {};
@@ -118,6 +121,9 @@ module.exports = async (req, res) => {
       catch (err) { bankError = err.response?.data?.error_code || err.message; console.error('notify plaid error:', bankError); }
     }
 
+    let refresh = null;
+    if (accessToken && !dry) refresh = await requestRefresh(accessToken, REFRESH_MIN_MINUTES);
+
     const sent = (await kv.get(PUSH_SENT_KEY)) || {};
     const notes = await computeNotifications(state, { ...bank, sent });
 
@@ -139,7 +145,7 @@ module.exports = async (req, res) => {
     for (const k of Object.keys(sent)) if (sent[k] < cutoff) delete sent[k];
     await kv.set(PUSH_SENT_KEY, sent);
 
-    return res.status(200).json({ ok: true, delivered, pending: Math.max(0, notes.length - MAX_PER_RUN), bankError });
+    return res.status(200).json({ ok: true, delivered, pending: Math.max(0, notes.length - MAX_PER_RUN), bankError, refresh: refresh?.status });
   } catch (err) {
     console.error('notify failed:', err);
     return res.status(500).json({ error: 'Notify run failed', detail: err.message });

@@ -17,6 +17,10 @@ module.exports = {
   // without a round-trip to Plaid on every load.
   ACCOUNTS_KEY: 'plaid:accounts',
 
+  // When we last asked Plaid to re-check the bank (and whether it refused), so
+  // on-demand refreshes stay throttled. See requestRefresh in _plaid.js.
+  REFRESH_KEY: 'plaid:last_refresh',
+
   // Push subscriptions — one per device that turned notifications on. Kept out
   // of app:state on purpose: that blob is last-write-wins from the browser, and
   // a stale tab saving would silently unsubscribe your phone.

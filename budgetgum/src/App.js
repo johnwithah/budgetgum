@@ -257,15 +257,23 @@ export default function App() {
   }, [authState, autofundKey, sts, tick]);
 
   // ── Sync with bank ────────────────────────────────────────────────────────
-  const syncBank = useCallback(async () => {
-    setSyncing(true);
+  // A normal Sync also asks Plaid to re-check the bank (throttled server-side),
+  // since Plaid otherwise only looks a few times a day. That refresh lands a
+  // minute or two later, so we follow up with quiet syncs that only speak up if
+  // they find something. `opts` may be a click event — only `followUp: true`
+  // counts.
+  const followUps = useRef([]);
+  const syncBank = useCallback(async (opts) => {
+    const followUp = opts?.followUp === true;
+    if (!followUp) setSyncing(true);
     try {
       // Only import transactions on/after this date, so old history doesn't
       // backfill into envelopes you just created. Defaults to July 14, 2026.
       const since = state.importSince || "2026-07-14";
-      const r = await api("/api/get_transactions", { since });
+      const r = await api("/api/get_transactions", { since, refresh: !followUp });
       if (r.status === 401) { setAuthState("locked"); setSyncing(false); return; }
       const d = await r.json();
+      if (followUp && !r.ok) return;
       if (!r.ok) {
         if (d.code === "RELINK") { setBankConnected(false); showToast("Bank needs re-linking"); }
         else if (d.code === "NO_BANK") { setBankConnected(false); showToast("No bank connected"); }
@@ -341,11 +349,25 @@ export default function App() {
       });
 
       const inflowNote = deposits.length ? `, ${deposits.length} deposit${deposits.length>1?"s":""}` : "";
-      showToast(`Synced — ${fresh.length} new${inflowNote}`);
-    } catch { showToast("Sync failed"); }
+      const refreshing = d.refresh?.status === "requested";
+      if (!followUp || fresh.length)
+        showToast(`Synced — ${fresh.length} new${inflowNote}${refreshing ? ". Checking your bank for newer…" : ""}`);
+      if (refreshing) {
+        followUps.current.forEach(clearTimeout);
+        followUps.current = [60000, 180000].map(ms =>
+          setTimeout(() => syncRef.current?.({ followUp: true }), ms));
+      }
+    } catch { if (!followUp) showToast("Sync failed"); }
     setSyncing(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transactions, envelopes, setState, state.importSince, state.ignored]);
+
+  // Follow-up syncs run from a timer, so they must call the LATEST syncBank —
+  // a stale one would compare against an old transaction list and re-import
+  // what the first sync already added.
+  const syncRef = useRef(syncBank);
+  syncRef.current = syncBank;
+  useEffect(() => () => followUps.current.forEach(clearTimeout), []);
 
   // ── The release mechanic ──────────────────────────────────────────────────
   // Applying a payment to an envelope: a debt balance drops, a goal grows, and
