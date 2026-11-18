@@ -8,7 +8,7 @@ import {
   lockDate, isLocked, isPaid, paidThisPeriod, periodKey, paymentHistory,
   spentThisMonth, targetAmount, suggestedPayment, progress, scheduleVariance, promoRisk,
   spentInMonth,
-  billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
+  billAmountStats, amountDrift, periodDueFor, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
   allocationsOf, splitsForEnvelope, matchSplit, incomeAmount,
@@ -3661,15 +3661,26 @@ function SplitSheet({ tx, envelopes, transactions, dataSince, onSave, onClose })
       setRows(rows.filter(r => r.envelopeId !== env.id));
       return;
     }
-    const key = periodKey(env, transactions, dataSince);
+    const p = periodFor(env);
     setRows([...rows, {
       envelopeId: env.id,
       amount: remaining > 0 ? String(remaining) : "",
-      funds: !isPaid(env, transactions, dataSince),
-      periodKey: key,
+      funds: !p.paid,
+      periodKey: p.key,
     }]);
   }
   const update = (id, patch) => setRows(rows.map(r => r.envelopeId === id ? { ...r, ...patch } : r));
+
+  // Which bill is this payback for? The period nearest the deposit date — the
+  // same nearest-due rule payments use — so splitting an October payback today
+  // judges October's bill, not November's.
+  function periodFor(env) {
+    const due = periodDueFor(env, tx.date);
+    const key = due ? due.toISOString().split("T")[0] : periodKey(env, transactions, dataSince);
+    const hist = paymentHistory(env, transactions, 12, dataSince).find(p => p.key === key);
+    const paid = Boolean(hist?.paid) || (env.manualPaidPeriods || []).includes(key) || env.manualPaidPeriod === key;
+    return { key, due: due || activeDueDate(env, transactions, dataSince), paid };
+  }
 
   return (
     <Sheet onClose={onClose} title="Split across bills">
@@ -3681,9 +3692,8 @@ function SplitSheet({ tx, envelopes, transactions, dataSince, onSave, onClose })
       <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:12}}>
         {bills.map(env => {
           const row = rows.find(r => r.envelopeId === env.id);
-          const paid = isPaid(env, transactions, dataSince);
-          const due = activeDueDate(env, transactions, dataSince);
-          const amt = targetAmount(env, periodKey(env, transactions, dataSince));
+          const { key, due, paid } = periodFor(env);
+          const amt = targetAmount(env, key);
           return (
             <div key={env.id} style={{background:row?"#c5f13512":"#2c2c2e",border:row?"1px solid #c5f13566":"1px solid transparent",borderRadius:13,padding:"11px 13px"}}>
               <button onClick={()=>toggleBill(env)}
