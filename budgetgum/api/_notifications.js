@@ -78,6 +78,8 @@ async function computeNotifications(state, { fresh = [], accounts = null, sent =
       else needsSort.push(t);
     } else if (envId && envelopes.find(e => e.id === envId)?.type === E.TYPES.SPENDING) {
       needsSort.push(t);   // a likely refund — the app asks where it goes
+    } else if (E.matchSplit(t, envelopes)) {
+      needsSort.push(t);   // a sender you split across bills before (roommate)
     }
   }
 

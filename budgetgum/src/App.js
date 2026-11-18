@@ -11,6 +11,7 @@ import {
   billAmountStats, amountDrift, periodDueForTx, dueDateOptions,
   safeToSpend, shortfall, upcomingLocks, buildAlerts, overdueInfo,
   matchEnvelope, normalizeMerchant,
+  allocationsOf, splitsForEnvelope, matchSplit, incomeAmount,
   incomeByMonth, incomeBySource, incomeByWeek, incomeStats, incomeTransactions,
   money, daysBetween, DOW,
 } from "./engine";
@@ -138,6 +139,7 @@ export default function App() {
   const [detailEnv, setDetailEnv] = useState(null);
   const [fundEnv, setFundEnv] = useState(null);
   const [mapTx, setMapTx] = useState(null);
+  const [splitTx, setSplitTx] = useState(null);     // a deposit being split across bills
   const [txDetail, setTxDetail] = useState(null);   // a sorted transaction being viewed/edited
   const [activityView, setActivityView] = useState("all");   // all | income
   const [insightsView, setInsightsView] = useState("spending");   // spending | debt | goals | income
@@ -299,6 +301,9 @@ export default function App() {
           const looksLikeRefund = Boolean(envId) &&
             envelopes.find(e => e.id === envId)?.type === TYPES.SPENDING;
           if (looksLikeRefund) needsAssign.push({ ...t, likelyRefund: true, suggestedEnvelopeId: envId });
+          // A sender you've split before (a roommate's Apple Cash) — ask how to
+          // split it rather than calling it income.
+          else if (matchSplit(t, envelopes)) needsAssign.push({ ...t, likelySplit: true });
           else deposits.push({ ...t, envelopeId: null, kind: "deposit" });
           return;
         }
@@ -463,10 +468,56 @@ export default function App() {
       transactions: s.transactions.filter(t => t.id !== tx.id),
       unmapped: s.unmapped.filter(t => t.id !== tx.id),
       ignored: [...(s.ignored || []), tx.id],
-      envelopes: s.envelopes.map(e => e.id === tx.envelopeId ? unapplyPayments(e, [tx]) : e),
+      envelopes: applySplit(
+        s.envelopes.map(e => e.id === tx.envelopeId ? unapplyPayments(e, [tx]) : e),
+        allocationsOf(s.transactions.find(t => t.id === tx.id) || tx), -1),
     }));
     setTxDetail(null);
     showToast("Deleted — won't return on sync");
+  }
+
+  // ── Split deposits ────────────────────────────────────────────────────────
+  // One incoming transfer divided across bills — a roommate's share of rent and
+  // electric. Shares marked `funds` go into that envelope's funded amount;
+  // the rest are just recorded (see allocationsOf in engine.js). Applying with
+  // sign −1 is the exact reversal, so re-splitting, removing a split, or
+  // deleting the deposit never leaves funded amounts drifted.
+  function applySplit(envs, allocations, sign) {
+    return envs.map(e => {
+      const delta = allocations
+        .filter(a => a.envelopeId === e.id && a.funds)
+        .reduce((sum, a) => sum + a.amount, 0);
+      return delta ? { ...e, funded: Math.max(0, (e.funded || 0) + sign * delta) } : e;
+    });
+  }
+
+  function splitCredit(tx, allocations, remember) {
+    const clean = allocations.filter(a => a.amount > 0.005);
+    const pattern = remember ? normalizeMerchant(tx.desc) : null;
+    setState(s => {
+      const existing = s.transactions.find(t => t.id === tx.id);
+      let envs = existing ? applySplit(s.envelopes, allocationsOf(existing), -1) : s.envelopes;
+      envs = applySplit(envs, clean, +1);
+      if (pattern) {
+        envs = envs.map(e => clean.some(a => a.envelopeId === e.id) && !(e.splitPatterns || []).includes(pattern)
+          ? { ...e, splitPatterns: [...(e.splitPatterns || []), pattern] } : e);
+      }
+      const next = {
+        ...(existing || tx), envelopeId: null, kind: "deposit",
+        likelyRefund: undefined, likelySplit: undefined, suggestedEnvelopeId: undefined,
+        allocations: clean.length ? clean : undefined,
+      };
+      return {
+        ...s,
+        envelopes: envs,
+        unmapped: s.unmapped.filter(t => t.id !== tx.id),
+        transactions: existing ? s.transactions.map(t => t.id === tx.id ? next : t) : [next, ...s.transactions],
+      };
+    });
+    setSplitTx(null); setMapTx(null); setTxDetail(null);
+    const funded = clean.filter(a => a.funds).reduce((sum, a) => sum + a.amount, 0);
+    showToast(!clean.length ? "Counted as income"
+      : `Split across ${clean.length} bill${clean.length === 1 ? "" : "s"}${funded ? ` — ${money(funded)} funded` : ""}`);
   }
 
   function fund(envId, amount) {
@@ -1157,7 +1208,11 @@ export default function App() {
                       : <EnvIcon env={env} size={36} radius={10} />}
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:15,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{tx.desc}</div>
-                      <div style={{fontSize:12,color:"#636366",marginTop:1}}>{isDeposit?"Deposit":env?.name||"Unassigned"} · {tx.date}</div>
+                      <div style={{fontSize:12,color:"#636366",marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {tx.allocations
+                          ? `Split · ${tx.allocations.map(a => envelopes.find(e => e.id === a.envelopeId)?.name || "?").join(", ")}`
+                          : isDeposit ? "Deposit" : env?.name || "Unassigned"} · {tx.date}
+                      </div>
                     </div>
                     <div style={{fontSize:15,fontWeight:600,color:isDeposit?"#30d158":"#aeaeb2"}}>
                       {isDeposit?`+${money(Math.abs(tx.amount))}`:`−${money(tx.amount)}`}
@@ -1208,6 +1263,7 @@ export default function App() {
                       onClose={()=>setFundEnv(null)} />}
       {mapTx     && <AssignSheet tx={mapTx} envelopes={envelopes}
                       onAssign={assignTx}
+                      onSplit={()=>{ setSplitTx(mapTx); setMapTx(null); }}
                       onSkip={()=>{
                         // A skipped credit is income — keep it in the record so
                         // earnings history stays complete. A skipped debit was
@@ -1222,7 +1278,12 @@ export default function App() {
                         setMapTx(null);
                       }}
                       onClose={()=>setMapTx(null)} />}
-      {txDetail  && <TransactionDetail tx={txDetail} envelopes={envelopes}
+      {splitTx   && <SplitSheet tx={transactions.find(t => t.id === splitTx.id) || splitTx}
+                      envelopes={envelopes} transactions={transactions} dataSince={dataSince}
+                      onSave={splitCredit} onClose={()=>setSplitTx(null)} />}
+      {txDetail  && <TransactionDetail tx={transactions.find(t => t.id === txDetail.id) || txDetail} envelopes={envelopes}
+                      onSplit={t=>{ setSplitTx(t); setTxDetail(null); }}
+                      onRemoveSplit={t=>splitCredit(t, [])}
                       onMove={moveTransaction}
                       onRequeue={requeueTransaction}
                       onDelete={deleteTransaction}
@@ -1549,7 +1610,10 @@ function IncomeView({ transactions, onOpenTx }) {
                   {new Date(t.date+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
                 </div>
               </div>
-              <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>+{money(Math.abs(t.amount))}</div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:15,fontWeight:700,color:"#30d158"}}>+{money(incomeAmount(t))}</div>
+                {t.allocations && <div style={{fontSize:11,color:"#636366",marginTop:1}}>of {money(Math.abs(t.amount))}</div>}
+              </div>
             </button>
           ))}
         </div>
@@ -1561,7 +1625,7 @@ function IncomeView({ transactions, onOpenTx }) {
 // ═════════════════════════════════════════════════════════════════════════════
 // TRANSACTION DETAIL — move, re-queue, or delete a sorted transaction
 // ═════════════════════════════════════════════════════════════════════════════
-function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onConvertToDeposit, onClose }) {
+function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPeriod, onConvertToDeposit, onSplit, onRemoveSplit, onClose }) {
   const [moving, setMoving] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const env = envelopes.find(e => e.id === tx.envelopeId);
@@ -1592,13 +1656,46 @@ function TransactionDetail({ tx, envelopes, onMove, onRequeue, onDelete, onSetPe
       {isDeposit && !env ? (
         !moving ? (
           <>
-            <div className="card" style={{padding:16,marginBottom:8,fontSize:13,color:"#8e8e93",lineHeight:1.55,textAlign:"center"}}>
-              Treated as income. It's already in your checking balance, so it isn't
-              subtracted from any envelope.
-            </div>
-            <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>
-              This was a refund — assign it
+            {tx.allocations ? (
+              <div className="grp" style={{marginBottom:8}}>
+                {tx.allocations.map(a => {
+                  const e = envelopes.find(x => x.id === a.envelopeId);
+                  return (
+                    <div key={a.envelopeId} className="row">
+                      {e ? <EnvIcon env={e} size={30} radius={8} /> : <div className="ibox">?</div>}
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:14.5,fontWeight:500}}>{e?.name || "Deleted envelope"}</div>
+                        <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>{a.funds ? "Added to funding" : "Recorded — bill was already paid"}</div>
+                      </div>
+                      <div style={{fontSize:14.5,fontWeight:600,color:"#30d158"}}>{money(a.amount)}</div>
+                    </div>
+                  );
+                })}
+                {incomeAmount(tx) > 0.005 && (
+                  <div className="row">
+                    <div style={{flex:1,fontSize:13,color:"#8e8e93"}}>Rest counts as income</div>
+                    <div style={{fontSize:14.5,fontWeight:600}}>{money(incomeAmount(tx))}</div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="card" style={{padding:16,marginBottom:8,fontSize:13,color:"#8e8e93",lineHeight:1.55,textAlign:"center"}}>
+                Treated as income. It's already in your checking balance, so it isn't
+                subtracted from any envelope.
+              </div>
+            )}
+            <button className="btn-dim" style={{marginBottom:8}} onClick={()=>onSplit(tx)}>
+              {tx.allocations ? "Edit split" : "Someone paid me back for bills — split it"}
             </button>
+            {tx.allocations ? (
+              <button className="btn-dim" style={{marginBottom:8}} onClick={()=>onRemoveSplit(tx)}>
+                Remove split — count it all as income
+              </button>
+            ) : (
+              <button className="btn-dim" style={{marginBottom:8}} onClick={()=>setMoving(true)}>
+                This was a refund — assign it
+              </button>
+            )}
           </>
         ) : (
           <div className="card" style={{padding:14,marginBottom:8}}>
@@ -3485,6 +3582,7 @@ function EnvelopeDetail({ env, transactions, dataSince, onClose, onEdit, onDelet
       )}
 
       <EnvelopeTransactions env={env} transactions={transactions} />
+      {isBill(env.type) && <SplitShares env={env} transactions={transactions} />}
 
       <div style={{display:"flex",gap:8,marginTop:6}}>
         <button className="btn-dim" style={{flex:1}} onClick={onEdit}>Edit</button>
@@ -3541,11 +3639,143 @@ function FundSheet({ env, sts, transactions, dataSince, onFund, onUnfund, onClos
   );
 }
 
-function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
+// ═════════════════════════════════════════════════════════════════════════════
+// SPLIT SHEET — divide an incoming transfer across bills (a roommate's share).
+// Each share defaults to funding the envelope if that bill's current period is
+// unpaid, or to just being recorded if it's already paid; you can flip either.
+// Whatever isn't allocated stays income.
+// ═════════════════════════════════════════════════════════════════════════════
+function SplitSheet({ tx, envelopes, transactions, dataSince, onSave, onClose }) {
+  const total = Math.abs(tx.amount);
+  const bills = envelopes.filter(e => isBill(e.type));
+  const [rows, setRows] = useState(() => allocationsOf(tx).map(a => ({ ...a, amount: String(a.amount) })));
+  const [remember, setRemember] = useState(true);
+
+  const num = v => Math.round((parseFloat(v) || 0) * 100) / 100;
+  const allocated = rows.reduce((sum, r) => sum + num(r.amount), 0);
+  const remaining = Math.round((total - allocated) * 100) / 100;
+  const over = remaining < -0.005;
+
+  function toggleBill(env) {
+    if (rows.some(r => r.envelopeId === env.id)) {
+      setRows(rows.filter(r => r.envelopeId !== env.id));
+      return;
+    }
+    const key = periodKey(env, transactions, dataSince);
+    setRows([...rows, {
+      envelopeId: env.id,
+      amount: remaining > 0 ? String(remaining) : "",
+      funds: !isPaid(env, transactions, dataSince),
+      periodKey: key,
+    }]);
+  }
+  const update = (id, patch) => setRows(rows.map(r => r.envelopeId === id ? { ...r, ...patch } : r));
+
+  return (
+    <Sheet onClose={onClose} title="Split across bills">
+      <div className="card" style={{padding:14,marginBottom:14}}>
+        <div style={{fontSize:15,fontWeight:600,marginBottom:3}}>{tx.desc}</div>
+        <div style={{fontSize:13,color:"#30d158"}}>+{money(total)} · {tx.date}</div>
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:12}}>
+        {bills.map(env => {
+          const row = rows.find(r => r.envelopeId === env.id);
+          const paid = isPaid(env, transactions, dataSince);
+          const due = activeDueDate(env, transactions, dataSince);
+          const amt = targetAmount(env, periodKey(env, transactions, dataSince));
+          return (
+            <div key={env.id} style={{background:row?"#c5f13512":"#2c2c2e",border:row?"1px solid #c5f13566":"1px solid transparent",borderRadius:13,padding:"11px 13px"}}>
+              <button onClick={()=>toggleBill(env)}
+                style={{display:"flex",alignItems:"center",gap:11,width:"100%",background:"none",border:"none",padding:0,cursor:"pointer",fontFamily:"inherit",color:"#fff",textAlign:"left"}}>
+                <EnvIcon env={env} size={30} radius={8} bg="transparent" />
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:15,fontWeight:500}}>{env.name}</div>
+                  <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>
+                    {periodLabel(due)} · {money(amt)} · {paid ? "paid" : "not paid yet"}
+                  </div>
+                </div>
+                <div style={{width:21,height:21,borderRadius:6,background:row?"#c5f135":"#48484a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#000",flexShrink:0}}>
+                  {row ? "✓" : ""}
+                </div>
+              </button>
+              {row && (
+                <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}>
+                  <input className="in" type="number" inputMode="decimal" min="0" step="0.01" value={row.amount}
+                    onChange={e=>update(env.id, { amount: e.target.value })}
+                    style={{width:110,padding:"8px 12px",fontSize:14}} />
+                  <button onClick={()=>update(env.id, { funds: !row.funds })}
+                    style={{flex:1,background:row.funds?"#30d15822":"#3a3a3c",color:row.funds?"#30d158":"#aeaeb2",border:"none",borderRadius:9,
+                            padding:"9px 10px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+                    {row.funds ? "Adds to funding" : "Record only"}
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="card" style={{padding:"11px 14px",marginBottom:10,fontSize:13,display:"flex",justifyContent:"space-between",
+                                    color:over?"#ff375f":"#8e8e93",border:over?"1px solid #ff375f66":"none"}}>
+        <span>{over ? "More than the deposit" : remaining > 0.005 ? "Stays as income" : "Fully split"}</span>
+        <span style={{fontWeight:600,color:over?"#ff375f":"#fff"}}>{money(Math.abs(remaining))}</span>
+      </div>
+      <div style={{fontSize:11.5,color:"#636366",lineHeight:1.5,margin:"0 2px 12px"}}>
+        "Adds to funding" sets the share aside in that envelope, so it covers part of the bill.
+        "Record only" is for bills you already paid: the share is logged on the bill and goes to Safe to Spend.
+      </div>
+
+      <button onClick={()=>setRemember(!remember)}
+        style={{background:"#2c2c2e",border:"none",borderRadius:12,padding:"12px 14px",width:"100%",display:"flex",alignItems:"center",gap:11,cursor:"pointer",fontFamily:"inherit",marginBottom:10}}>
+        <div style={{width:21,height:21,borderRadius:6,background:remember?"#c5f135":"#48484a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#000",flexShrink:0}}>
+          {remember?"✓":""}
+        </div>
+        <div style={{flex:1,textAlign:"left"}}>
+          <div style={{fontSize:13.5,fontWeight:500,color:"#fff"}}>Ask me next time</div>
+          <div style={{fontSize:11.5,color:"#8e8e93",marginTop:1}}>Deposits like this go to the sort queue instead of income</div>
+        </div>
+      </button>
+      <button className="btn-green" style={{fontSize:15,padding:14}} disabled={over || !rows.some(r => num(r.amount) > 0)}
+        onClick={()=>onSave(tx, rows.map(r => ({ ...r, amount: num(r.amount) })), remember)}>
+        Save split
+      </button>
+    </Sheet>
+  );
+}
+
+// Shares of split deposits that landed on a bill — "Roommate sent $55 toward
+// this." Shown on the bill's detail screen.
+function SplitShares({ env, transactions }) {
+  const shares = splitsForEnvelope(env, transactions);
+  if (!shares.length) return null;
+  return (
+    <>
+      <Label style={{marginTop:14}}>Paid back by others</Label>
+      <div className="grp" style={{marginBottom:12}}>
+        {shares.slice(0, 12).map(sh => (
+          <div key={sh.tx.id} className="row" style={{padding:"11px 14px"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:14,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{sh.tx.desc}</div>
+              <div style={{fontSize:11.5,color:"#636366",marginTop:1}}>
+                {new Date(sh.tx.date+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                {sh.periodKey && ` · ${periodLabel(new Date(sh.periodKey+"T00:00:00"))} bill`}
+                {sh.funds ? " · funded" : " · recorded"}
+              </div>
+            </div>
+            <div style={{fontSize:14,fontWeight:600,color:"#30d158"}}>+{money(sh.amount)}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function AssignSheet({ tx, envelopes, onAssign, onSplit, onSkip, onClose }) {
   const [remember, setRemember] = useState(true);
   const isCredit = tx.amount <= 0;
   return (
-    <Sheet onClose={onClose} title={isCredit ? "Money came back — where from?" : "Where does this go?"}>
+    <Sheet onClose={onClose} title={tx.likelySplit ? "Split this across bills?" : isCredit ? "Money came back — where from?" : "Where does this go?"}>
       <div className="card" style={{padding:14,marginBottom:14}}>
         <div style={{fontSize:15,fontWeight:600,marginBottom:3}}>{tx.desc}</div>
         <div style={{fontSize:13,color:isCredit?"#30d158":"#8e8e93"}}>
@@ -3553,6 +3783,11 @@ function AssignSheet({ tx, envelopes, onAssign, onSkip, onClose }) {
         </div>
       </div>
 
+      {isCredit && (
+        <button className={tx.likelySplit ? "btn-green" : "btn-dim"} style={{marginBottom:12,fontSize:14.5,padding:13}} onClick={onSplit}>
+          Someone paid me back for bills — split it
+        </button>
+      )}
       {isCredit && (
         <div className="card" style={{padding:13,marginBottom:14,border:"1px solid #30d15833"}}>
           <div style={{fontSize:12.5,color:"#8e8e93",lineHeight:1.55}}>

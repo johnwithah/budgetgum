@@ -84,6 +84,8 @@ An **envelope** carries type-specific fields (see `EnvelopeForm` in App.js for t
 
 A **transaction** carries Plaid's sign convention unmodified: **positive = outflow (debit/charge), negative/zero = inflow (deposit/credit)**. Never `Math.abs()` this — several past bugs (see `convertToDeposit`, `fixAllDeposits` in App.js) exist specifically to repair transactions imported before this convention was enforced. `envelopeId: null` + negative amount = income (see Income below). A transaction may carry a `periodOverride` (an ISO due-date string) that force-assigns which bill period it counts toward, overriding the automatic nearest-due-date heuristic.
 
+**Split deposits** (a roommate paying back their share of several bills in one transfer): a credit keeps `envelopeId: null` and carries `allocations: [{ envelopeId, amount, funds, periodKey }]`. `funds: true` (default when that bill's period was unpaid) added the share to the envelope's `funded`; `funds: false` (bill already paid) only records it. `applySplit(envs, allocations, ±1)` in App.js is the exact apply/reverse, used by `splitCredit` (re-split/remove) and `deleteTransaction`. Only the unallocated remainder counts as income (`incomeAmount`/`incomeTransactions` in engine.js); shares never make a bill "paid" (payment logic only reads outflows with `envelopeId`). Envelopes may carry `splitPatterns` — credit-only merchant patterns (`matchSplit`) that route matching deposits to the sort queue (`likelySplit`) instead of income; kept separate from `matchPatterns` so money you *send* via the same service never matches a bill as a payment.
+
 ## Funding, Safe to Spend, and the funded-balance carryover
 
 Three zones of money (see the "THE LOCK" and "SAFE TO SPEND" sections of `engine.js`):

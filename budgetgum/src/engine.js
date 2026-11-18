@@ -959,12 +959,52 @@ export function buildAlerts(envelopes, transactions, checkingBalance, dataSince 
 // actually landed, what it's averaging, and how uneven it's been.
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Plaid signs inflows negative; income is reported positive.
-const inflowAmount = t => Math.abs(t.amount);
+// ── Split deposits ────────────────────────────────────────────────────────────
+// Money that comes IN but isn't income: a roommate's share of the rent and the
+// electric, sent as one Apple Cash transfer. The deposit stays a single
+// transaction (envelopeId null — it's not a refund to one envelope) and carries
+// `allocations`: [{ envelopeId, amount, funds, periodKey }].
+//
+//   funds: true  — the bill's period was unpaid when you split it, so that share
+//                  was added to the envelope's `funded`. Safe to Spend doesn't
+//                  move: the money arrived already spoken for.
+//   funds: false — the bill was already paid (you fronted it), so the share is
+//                  just recorded against it and lands in Safe to Spend.
+//
+// `funds` is decided once, when you split, and stored — so undoing a split
+// reverses exactly what it did, even if the bill's paid state changed since.
+// Anything not allocated is still income.
+export const allocationsOf = t => t.allocations || [];
+export const allocatedTotal = t => allocationsOf(t).reduce((s, a) => s + (a.amount || 0), 0);
+
+// Every split share that landed on this envelope, as display rows.
+export function splitsForEnvelope(env, transactions) {
+  const out = [];
+  for (const t of transactions) {
+    for (const a of allocationsOf(t)) {
+      if (a.envelopeId === env.id) out.push({ tx: t, ...a });
+    }
+  }
+  return out.sort((a, b) => (a.tx.date < b.tx.date ? 1 : -1));
+}
+
+// Credits you've asked to split before (e.g. "apple cash") go to the sort queue
+// instead of straight to income. Checked against credits only — a payment YOU
+// send through Apple Cash must never look like a bill payment.
+export function matchSplit(tx, envelopes) {
+  const norm = normalizeMerchant(tx.desc);
+  if (!norm) return false;
+  return envelopes.some(e => (e.splitPatterns || []).some(p => norm.includes(p)));
+}
+
+// Plaid signs inflows negative; income is reported positive. A split deposit
+// only counts for whatever wasn't allocated to bills.
+const inflowAmount = t => Math.max(0, Math.abs(t.amount) - allocatedTotal(t));
+export const incomeAmount = inflowAmount;
 
 export function incomeTransactions(transactions) {
   return transactions
-    .filter(t => t.amount < 0 && !t.envelopeId)
+    .filter(t => t.amount < 0 && !t.envelopeId && inflowAmount(t) > 0.005)
     .slice()
     .sort((a, b) => (a.date < b.date ? 1 : -1));
 }
