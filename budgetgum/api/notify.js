@@ -59,7 +59,31 @@ async function fetchFromBank(accessToken, importSince) {
   return {
     fresh: r.data.transactions.filter(t => t.date >= start).map(mapTransaction),
     accounts: r.data.accounts.map(mapAccount),
+    total: r.data.total_transactions,
   };
+}
+
+// Dry-run only: is the app's transaction list keeping up with the bank? Shows
+// when Plaid last pulled from the bank, and every recent transaction Plaid has
+// that the app doesn't — with the reason a Sync would skip it, if any.
+async function syncHealth(accessToken, state, bank) {
+  const health = { appLastSync: state.lastSync || null, importSince: state.importSince || null };
+  try {
+    const item = await plaidClient.itemGet({ access_token: accessToken });
+    const t = item.data.status?.transactions || {};
+    health.plaidLastRefresh = t.last_successful_update || null;
+    health.plaidLastFailedRefresh = t.last_failed_update || null;
+  } catch (err) { health.itemError = err.response?.data?.error_code || err.message; }
+
+  const inApp = new Set([...(state.transactions || []), ...(state.unmapped || [])].map(t => t.id));
+  const ignored = new Set(state.ignored || []);
+  health.plaidReturned = bank.fresh.length;
+  health.plaidTotal = bank.total ?? null;
+  health.newestInApp = (state.transactions || []).reduce((m, t) => (t.date > m ? t.date : m), '') || null;
+  health.notInApp = bank.fresh
+    .filter(t => !inApp.has(t.id))
+    .map(t => ({ date: t.date, desc: t.desc, amount: t.amount, ...(t.pending && { pending: true }), ...(ignored.has(t.id) && { ignored: true }) }));
+  return health;
 }
 
 module.exports = async (req, res) => {
@@ -97,7 +121,10 @@ module.exports = async (req, res) => {
     const sent = (await kv.get(PUSH_SENT_KEY)) || {};
     const notes = await computeNotifications(state, { ...bank, sent });
 
-    if (dry) return res.status(200).json({ dry: true, timeZone, hour, quiet, bankError, notifications: notes });
+    if (dry) {
+      const sync = accessToken ? await syncHealth(accessToken, state, bank) : null;
+      return res.status(200).json({ dry: true, timeZone, hour, quiet, bankError, sync, notifications: notes });
+    }
 
     const delivered = [];
     for (const n of notes.slice(0, MAX_PER_RUN)) {
